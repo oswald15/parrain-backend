@@ -1,0 +1,25 @@
+# Secrets et configuration locale
+.env
+.env.*
+!.env.example
+!.env.prod.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+env/
+venv/
+
+# Django
+db.sqlite3
+staticfiles/
+media/
+
+# Dumps de base (donnees clients)
+*.sql
+backups/
+
+# IDE
+.idea/
+.vscode/

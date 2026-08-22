@@ -6,3 +6,12 @@ __pycache__
 .idea
 db.sqlite3
 le_parrain_backup.sql
+
+# Secrets : injectes au runtime par env_file, jamais dans l'image
+.env
+.env.*
+
+# Volumes / donnees : montes au runtime, ne doivent pas alourdir l'image
+media/
+staticfiles/
+backups/

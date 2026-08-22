@@ -1,0 +1,530 @@
+================================================================================
+LE PARRAIN — GUIDE DE DÉPLOIEMENT DU BACKEND SUR VPS (DOCKER)
+================================================================================
+Portée : déploiement du backend Django/DRF (API REST + admin Django + console
+système éditeur) et de sa base PostgreSQL, via Docker, sur un VPS. Le frontend
+Angular (console web / caisse) est distribué séparément (Vercel ou autre) et
+pointera vers l'URL publique de cette API ; l'application mobile également.
+
+Fichiers concernés : compose.prod.yml (fichier de déploiement production,
+autonome — distinct de docker-compose.yml qui reste dédié au développement
+local), .env (réglages de déploiement, non versionné, modèle dans
+.env.prod.example), Dockerfile, entrypoint.sh.
+
+
+1. PRÉREQUIS
+--------------------------------------------------------------------------------
+- VPS Linux (Ubuntu 22.04/24.04 LTS recommandé), accès root ou sudo.
+- Dimensionnement minimal : 1 vCPU, 2 Go RAM, 20 Go disque. Deux conteneurs
+  tournent en permanence (Django + PostgreSQL) ; PostgreSQL et la génération
+  de factures PDF (xhtml2pdf/reportlab) sont les postes les plus gourmands.
+  En dessous de 1 Go de RAM, ajouter un fichier swap (§11).
+- Un nom de domaine (ou sous-domaine) pointant vers l'IP du VPS, ex.
+  api.mondomaine.com (enregistrement DNS de type A).
+- Ports à ouvrir : 22 (SSH), 80 (HTTP, redirection + défi Let's Encrypt),
+  443 (HTTPS). Le port de gunicorn (8000) et celui de PostgreSQL (5432) ne
+  doivent JAMAIS être exposés directement sur internet — cf. §5 et §13.
+
+Particularités de ce service, à garder en tête pour tout le reste du guide :
+
+  - L'authentification est applicative (jetons DRF) : contrairement à un
+    service sans auth, Nginx n'a pas à protéger l'API par mot de passe. En
+    revanche AUCUNE limitation de débit n'existe sur /api/auth/login/ ni sur
+    /api/console/auth/login/ — la protection anti-force-brute se fait au
+    niveau de Nginx (§7.5).
+  - Le SaaS est multi-organisation : la console système (/api/console/) crée
+    les organisations, émet les codes d'activation signés et gère les
+    abonnements. Elle a son propre compte (modèle Editeur, login par email),
+    distinct des utilisateurs métier (modèle User, login par téléphone).
+  - Les codes d'activation de licence sont signés en Ed25519 avec une clé
+    privée lue dans .env. Cette clé est la racine de confiance du système
+    d'abonnement : si elle fuit, n'importe qui peut fabriquer une licence
+    perpétuelle. Si elle est perdue ou changée, tous les codes déjà émis
+    deviennent invalides.
+  - Deux middlewares bloquent les écritures selon l'état métier
+    (console/middleware.py : licence expirée ; organisations/middleware.py :
+    journée non ouverte). Des 403 en production ne sont donc pas forcément un
+    problème de déploiement — lire le message renvoyé.
+
+  /!\ AVANT TOUT DÉPLOIEMENT : le .env de développement est actuellement
+  COMMITÉ dans le dépôt, avec SECRET_KEY et la clé privée Ed25519. Ces deux
+  secrets sont à considérer comme compromis. La procédure du §4 en génère de
+  nouveaux ; le §13 explique comment sortir .env du dépôt.
+
+
+2. PRÉPARATION DU VPS
+--------------------------------------------------------------------------------
+2.1 Mise à jour et utilisateur non-root
+    apt update && apt upgrade -y
+    adduser parrain && usermod -aG sudo parrain
+    # se reconnecter en tant que "parrain" pour la suite
+
+2.2 Pare-feu (UFW)
+    sudo ufw allow OpenSSH
+    sudo ufw allow 80/tcp
+    sudo ufw allow 443/tcp
+    sudo ufw enable
+    sudo ufw status
+    # ni 8000 ni 5432 : ils ne sont publiés que sur 127.0.0.1 (§5)
+
+2.3 Installer Docker Engine + Docker Compose plugin
+    curl -fsSL https://get.docker.com | sudo sh
+    sudo usermod -aG docker $USER
+    # se déconnecter/reconnecter pour appliquer le groupe docker
+    docker --version
+    docker compose version
+
+
+3. RÉCUPÉRER LE CODE
+--------------------------------------------------------------------------------
+    git clone git@github.com:oswald15/parrain-backend.git parrain-backend
+    cd parrain-backend
+    # ou, sans git : transférer l'archive du dépôt via scp/rsync puis
+    # décompresser sur le VPS.
+
+Le dossier media/ du dépôt (images produits de développement) et les dumps
+backups/*.sql, le_parrain_backup.sql ne sont pas copiés dans l'image : ils
+sont listés dans .dockerignore. Les images uploadées en production vivront
+dans le dossier ./media du VPS, monté dans le conteneur (§5).
+
+
+4. CONFIGURATION
+--------------------------------------------------------------------------------
+    cp .env.prod.example .env
+
+Puis remplir. Les valeurs à générer :
+
+4.1 SECRET_KEY (jamais celle du dépôt) :
+    docker run --rm python:3.13-slim python -c \
+      "import secrets; print(secrets.token_urlsafe(64))"
+
+4.2 DB_PASSWORD :
+    openssl rand -base64 32
+
+4.3 DEBUG=False — obligatoire. Avec DEBUG=True, Django affiche la trace
+    complète (et donc des extraits de configuration) à chaque erreur 500, et
+    ALLOWED_HOSTS n'est plus vérifié.
+
+4.4 Domaines. le_parrain/settings.py contient une liste de base pour le
+    développement (localhost, l'IP LAN du poste de dev, *.ngrok-free.app) et
+    la complète avec trois variables d'environnement — le fichier n'a donc
+    jamais à être modifié par environnement :
+
+    EXTRA_ALLOWED_HOSTS   le domaine de l'API, sans schéma
+                          ex. api.mondomaine.com
+    EXTRA_CORS_ORIGINS    les origines du frontend, AVEC schéma
+                          ex. https://console.mondomaine.com
+    EXTRA_CSRF_ORIGINS    l'API + le frontend, avec schéma — nécessaire pour
+                          se connecter à l'admin Django en HTTPS et pour les
+                          POST du frontend qui envoient un cookie de session
+
+    Oublier EXTRA_ALLOWED_HOSTS donne un « DisallowedHost » (400) sur chaque
+    requête ; oublier EXTRA_CORS_ORIGINS donne un frontend qui affiche des
+    erreurs CORS dans la console du navigateur alors que l'API répond bien.
+
+4.5 Clés de signature des licences. À générer UNE FOIS, sur le VPS, après le
+    premier build (§5) :
+
+    docker compose run --rm backend python manage.py generer_cle_editeur
+
+    La commande affiche les deux lignes à coller dans .env. Ne pas réutiliser
+    celles du dépôt. Conserver la clé privée hors du VPS également (coffre de
+    mots de passe) : sans elle, plus aucun code d'activation ne peut être
+    émis. La changer plus tard invalide tous les codes déjà distribués.
+
+4.6 EDITEUR_BOOTSTRAP_EMAIL / EDITEUR_BOOTSTRAP_PASSWORD : identifiants du
+    premier compte éditeur, consommés une seule fois par « amorcer_console »
+    (§6.2). Les retirer du .env ensuite.
+
+Ne jamais committer .env — vérifier qu'il est bien listé dans .gitignore.
+
+
+5. LANCEMENT DE LA STACK
+--------------------------------------------------------------------------------
+    docker compose up -d --build
+
+COMPOSE_FILE=compose.prod.yml dans .env évite de répéter "-f compose.prod.yml"
+sur chaque commande ; COMPOSE_PROJECT_NAME=parrain fixe le préfixe des
+ressources (le volume de la base s'appelle alors "parrain_pgdata", utile pour
+les sauvegardes, §9).
+
+compose.prod.yml est un fichier autonome dédié à la production (pas une
+surcharge fusionnée avec docker-compose.yml, qui reste le fichier de
+développement local). Différences avec le fichier de dev :
+
+    - gunicorn (3 workers) au lieu de « manage.py runserver », via
+      entrypoint.sh qui joue d'abord migrate puis collectstatic.
+    - Le code n'est plus bind-monté (.:/app) : l'image est la source de
+      vérité, un « git pull » seul ne suffit plus, il faut rebuilder (§10).
+    - Le port de gunicorn n'est publié que sur 127.0.0.1:${BACKEND_PORT} —
+      injoignable depuis internet, seul le reverse proxy local (Nginx, §7)
+      y accède.
+    - La base n'est plus publiée du tout : plus de "ports: 5432:5432". En dev
+      ce port ouvert permet de brancher un client SQL ; en production il
+      exposerait PostgreSQL à internet entier.
+    - ./staticfiles et ./media sont bind-montés : avec DEBUG=False, Django ne
+      sert plus les fichiers statiques ni les médias, c'est Nginx qui les lit
+      directement sur le disque de l'hôte (§7.3).
+    - Les logs sont plafonnés (3 fichiers de 10 Mo) : gunicorn journalise
+      chaque requête, sans plafond le disque du VPS finit par se remplir.
+    - restart: unless-stopped, comme en dev, suffit à relancer les conteneurs
+      au reboot du VPS (le service docker est activé par défaut).
+
+Vérifications :
+    docker compose ps                        # les deux conteneurs "healthy"
+    docker compose logs -f backend           # migrations OK, gunicorn démarré
+    curl -I http://127.0.0.1:8000/admin/login/
+    # -> HTTP/1.1 200 OK
+
+
+6. AMORÇAGE (première mise en service uniquement)
+--------------------------------------------------------------------------------
+Les migrations ont déjà tourné (entrypoint.sh). Restent trois opérations
+manuelles, dans cet ordre.
+
+6.1 Vérifier que les clés Ed25519 sont bien dans .env (§4.5). Si elles ont
+    été ajoutées après le premier « up » :
+        docker compose up -d
+
+6.2 Créer les formules d'abonnement d'exemple et le premier compte éditeur :
+        docker compose exec backend python manage.py amorcer_console
+
+    La commande est idempotente : relancée, elle ne recrée rien. Si
+    EDITEUR_BOOTSTRAP_PASSWORD est absent du .env, un mot de passe est généré
+    et AFFICHÉ dans la sortie — le noter immédiatement, il n'est pas
+    récupérable ensuite.
+
+    Ce compte se connecte sur /api/console/auth/login/ (email + mot de passe)
+    et sert à créer les organisations clientes, émettre leurs codes
+    d'activation et enregistrer leurs paiements.
+
+6.3 (optionnel) Un superutilisateur Django pour l'admin /admin/. Le modèle
+    utilisateur s'authentifie par TÉLÉPHONE, pas par email :
+        docker compose exec backend python manage.py createsuperuser
+        # Phone: 690000000     Name: Admin technique
+
+    L'admin Django est un outil de dépannage, pas l'interface d'exploitation
+    (celle-ci est le frontend + la console). L'exposer publiquement est une
+    surface d'attaque : cf. §7.5 pour le restreindre par IP.
+
+Les organisations clientes, elles, ne se créent PAS en ligne de commande :
+depuis la console (POST /api/console/organisations/), puis
+/api/console/organisations/<id>/creer-superadmin/ pour le premier compte
+métier, puis /api/console/codes/emettre/ pour le code d'activation à
+transmettre au client.
+
+
+7. REVERSE PROXY NGINX + HTTPS (LET'S ENCRYPT)
+--------------------------------------------------------------------------------
+7.1 Installer Nginx et Certbot
+    sudo apt install -y nginx certbot python3-certbot-nginx
+
+7.2 Réglages de proxy communs, dans un snippet réutilisable
+    (/etc/nginx/snippets/parrain-proxy.conf) :
+
+proxy_pass http://127.0.0.1:8000;
+proxy_http_version 1.1;
+proxy_set_header Host              $host;
+proxy_set_header X-Real-IP         $remote_addr;
+proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+# Sans X-Forwarded-Proto, Django croit répondre en HTTP : les URL absolues
+# qu'il construit (images de produits dans les réponses JSON, pagination DRF,
+# redirections de l'admin) repartent en http:// et le navigateur les bloque
+# comme contenu mixte. Cf. la note SECURE_PROXY_SSL_HEADER au §13.
+proxy_set_header X-Forwarded-Proto $scheme;
+# La génération d'une facture PDF peut prendre plusieurs dizaines de secondes
+# sur un petit VPS ; le défaut de 60 s couperait la requête.
+proxy_read_timeout 120s;
+proxy_send_timeout 120s;
+
+7.3 Configuration du site (/etc/nginx/sites-available/parrain-api) :
+
+server {
+    listen 80;
+    server_name api.mondomaine.com;
+
+    # Upload d'images de produits (media/images/). Ajuster si besoin ; sans
+    # cette ligne, tout fichier au-delà de 1 Mo est refusé en 413 par Nginx,
+    # avant même d'atteindre Django.
+    client_max_body_size 10M;
+
+    # --- Fichiers servis directement par Nginx (jamais par Django) ---
+    # Avec DEBUG=False, Django ne sert ni /static/ ni /media/. Sans ces deux
+    # blocs, l'admin s'affiche sans CSS et les images produits renvoient 404.
+    location /static/ {
+        alias /home/parrain/parrain-backend/staticfiles/;
+        expires 30d;
+        access_log off;
+    }
+    location /media/ {
+        alias /home/parrain/parrain-backend/media/;
+        expires 7d;
+    }
+
+    location / {
+        include snippets/parrain-proxy.conf;
+    }
+}
+
+    sudo ln -s /etc/nginx/sites-available/parrain-api /etc/nginx/sites-enabled/
+    sudo nginx -t
+    sudo systemctl reload nginx
+
+7.4 Droits sur les fichiers servis : les deux dossiers sont créés par Docker
+    et appartiennent à root. Nginx (www-data) doit pouvoir les traverser :
+        ls -ld /home/parrain /home/parrain/parrain-backend/staticfiles
+        sudo chmod o+x /home/parrain            # traversée du home
+    Un 403 sur /static/ ou /media/ vient presque toujours de là.
+
+7.5 Durcissements recommandés (aucun n'est fourni par l'application) :
+
+    # Au niveau http (dans /etc/nginx/nginx.conf ou un fichier de conf.d) :
+    limit_req_zone $binary_remote_addr zone=parrain_login:10m rate=10r/m;
+
+    # Dans le bloc server : freine la force brute sur les deux logins, qui ne
+    # sont limités NULLE PART côté applicatif.
+    location = /api/auth/login/ {
+        limit_req zone=parrain_login burst=5 nodelay;
+        include snippets/parrain-proxy.conf;
+    }
+    location = /api/console/auth/login/ {
+        limit_req zone=parrain_login burst=5 nodelay;
+        include snippets/parrain-proxy.conf;
+    }
+
+    # L'admin Django est un outil de dépannage : le réserver à votre IP.
+    location /admin/ {
+        allow 203.0.113.10;   # votre IP fixe / VPN
+        deny all;
+        include snippets/parrain-proxy.conf;
+    }
+
+    # La console système gouverne tous les abonnements de tous les clients.
+    # Si elle n'est utilisée que depuis vos postes, la restreindre de même :
+    # location /api/console/ { allow 203.0.113.10; deny all; ... }
+
+7.6 Activer HTTPS (génère le certificat et adapte automatiquement le bloc
+    server ci-dessus pour rediriger le HTTP vers HTTPS) :
+    sudo certbot --nginx -d api.mondomaine.com
+
+    Le renouvellement automatique est configuré par certbot (timer systemd) ;
+    vérifier avec : sudo certbot renew --dry-run
+
+
+8. VÉRIFICATION POST-DÉPLOIEMENT
+--------------------------------------------------------------------------------
+    curl -I https://api.mondomaine.com/admin/login/
+    # -> 200, et la page doit s'afficher AVEC son CSS dans un navigateur
+    #    (sinon : §7.3 /static/, ou collectstatic non joué)
+
+    curl -s -o /dev/null -w '%{http_code}\n' https://api.mondomaine.com/api/orders/
+    # -> 401  (authentification DRF active — un 200 ici serait une faille)
+
+    curl -s -X POST https://api.mondomaine.com/api/console/auth/login/ \
+         -H 'Content-Type: application/json' \
+         -d '{"email":"editeur@mondomaine.com","password":"..."}'
+    # -> le jeton de la console
+
+    curl --connect-timeout 5 http://<IP-DU-VPS>:8000/admin/login/
+    curl --connect-timeout 5 http://<IP-DU-VPS>:5432/
+    # -> les deux doivent ÉCHOUER (connexion refusée / timeout). Une réponse
+    #    signifie que le port est exposé : revoir compose.prod.yml et UFW.
+
+Trois choses qui peuvent être silencieusement cassées, à tester une fois :
+
+    - Persistance : « docker compose restart » puis se reconnecter. Les
+      données doivent être là. Si la base repart vide, le volume pgdata n'est
+      pas monté (ou un « down -v » traîne dans les habitudes, §10).
+    - Upload d'image produit depuis le frontend, puis rechargement de la page.
+      L'image doit s'afficher : elle passe par /media/ (§7.3) et est stockée
+      dans ./media côté hôte, pas dans le conteneur.
+    - Facture PDF (/api/orders/.../invoice-pdf/) : c'est la seule requête
+      longue de l'application, elle valide le proxy_read_timeout du §7.2.
+
+
+9. SAUVEGARDES
+--------------------------------------------------------------------------------
+Deux choses à sauvegarder, et une troisième à mettre à l'abri.
+
+9.1 La base (l'essentiel : commandes, stock, utilisateurs, abonnements) :
+    mkdir -p ~/backups
+    cd ~/parrain-backend && set -a && . ./.env && set +a
+    docker compose exec -T db pg_dump -U "$DB_USER" "$DB_NAME" \
+        > ~/backups/le_parrain_$(date +%Y%m%d_%H%M%S).sql
+
+9.2 Les médias (images de produits, non reconstructibles) :
+    tar czf ~/backups/media_$(date +%Y%m%d).tar.gz -C ~/parrain-backend media
+
+9.3 La clé privée Ed25519 du .env : hors du VPS, dans un coffre de mots de
+    passe. Une base restaurée sans cette clé ne peut plus émettre de codes
+    d'activation valides pour les licences déjà en circulation.
+
+À planifier via cron (quotidien, rotation à 30 jours) :
+
+    crontab -e
+    # noter les % échappés, obligatoire dans une crontab :
+    15 3 * * * cd ~/parrain-backend && set -a && . ./.env && set +a && \
+      /usr/bin/docker compose exec -T db pg_dump -U "$DB_USER" "$DB_NAME" \
+      > ~/backups/le_parrain_$(date +\%Y\%m\%d).sql && \
+      find ~/backups -name 'le_parrain_*.sql' -mtime +30 -delete
+
+Restauration :
+    docker compose exec -T db psql -U "$DB_USER" -d "$DB_NAME" \
+        < ~/backups/le_parrain_20260820.sql
+
+    Sur une base non vide, repartir d'un schéma propre d'abord :
+        docker compose exec -T db psql -U "$DB_USER" -d "$DB_NAME" \
+            -c 'DROP SCHEMA public CASCADE; CREATE SCHEMA public;'
+
+Sauvegarde du volume entier (équivalent, si l'on préfère raisonner en volume ;
+le nom parrain_pgdata vient du COMPOSE_PROJECT_NAME du §5) — conteneurs
+arrêtés, sinon la copie est incohérente :
+    docker compose stop
+    docker run --rm -v parrain_pgdata:/data -v $(pwd):/backup \
+        alpine tar czf /backup/pgdata_$(date +%Y%m%d).tar.gz -C /data .
+    docker compose start
+
+
+10. MISE À JOUR DE L'APPLICATION
+--------------------------------------------------------------------------------
+    cd ~/parrain-backend
+    docker compose exec -T db pg_dump -U "$DB_USER" "$DB_NAME" \
+        > ~/backups/avant_maj_$(date +%Y%m%d_%H%M%S).sql   # toujours
+    git pull
+    docker compose up -d --build
+
+Le code n'étant plus bind-monté en production, un « git pull » sans --build ne
+change RIEN au conteneur en cours : c'est l'erreur la plus fréquente
+(« j'ai déployé mais le correctif n'est pas là »).
+
+Les migrations et collectstatic sont rejoués automatiquement au démarrage
+(entrypoint.sh). Les volumes ne sont pas recréés (pas de « down -v ») : les
+données persistent.
+
+    docker compose down -v      # ATTENTION : DÉTRUIT LA BASE. Jamais en prod.
+
+Deux points à revérifier à chaque mise à jour :
+
+    - De nouvelles variables dans .env.prod.example ? Les reporter dans le
+      .env du VPS — une variable manquante lue par config(...) sans valeur par
+      défaut fait planter le démarrage (UndefinedValueError dans les logs) et
+      le conteneur boucle en redémarrage.
+    - Une migration lourde sur une grosse table verrouille l'API le temps de
+      s'appliquer : la jouer hors heures de service du bar.
+
+
+11. COMMANDES UTILES / DÉPANNAGE
+--------------------------------------------------------------------------------
+    docker compose ps                            état des conteneurs
+    docker compose logs -f backend               logs applicatifs
+    docker compose logs -f db                    logs PostgreSQL
+    docker compose restart backend               redémarrage à chaud
+    docker compose exec backend python manage.py shell        shell Django
+    docker compose exec backend python manage.py showmigrations
+    docker compose exec db psql -U le_parrain    console SQL
+    docker stats                                 consommation CPU/RAM
+    sudo tail -f /var/log/nginx/error.log        côté proxy
+
+Symptômes fréquents :
+    - 502 Bad Gateway : le conteneur backend est arrêté, en boucle de
+      redémarrage, ou écoute ailleurs. « docker compose ps » puis
+      « curl -I http://127.0.0.1:8000/admin/login/ ». Si le curl local répond,
+      c'est le proxy_pass du snippet qui pointe à côté (BACKEND_PORT modifié
+      dans .env sans mettre à jour /etc/nginx).
+    - 400 Bad Request sur toutes les requêtes : le domaine n'est pas dans
+      ALLOWED_HOSTS. Ajouter EXTRA_ALLOWED_HOSTS dans .env (§4.4) puis
+      « docker compose up -d ».
+    - Erreurs CORS dans le navigateur alors que curl fonctionne : origine du
+      frontend absente d'EXTRA_CORS_ORIGINS. Le schéma (https://) et le port
+      font partie de l'origine.
+    - « CSRF verification failed » en se connectant à /admin/ en HTTPS :
+      EXTRA_CSRF_ORIGINS ne contient pas https://api.mondomaine.com.
+    - Admin sans CSS, images produits en 404 : /static/ ou /media/ mal servis
+      (§7.3), ou home non traversable par www-data (§7.4).
+    - 413 Request Entity Too Large à l'upload d'une image :
+      client_max_body_size (§7.3).
+    - 403 « licence » ou « journée non ouverte » sur les écritures : ce n'est
+      PAS un problème d'infrastructure, ce sont les middlewares métier
+      (console/middleware.py, organisations/middleware.py). Vérifier
+      l'abonnement de l'organisation dans la console, ou faire ouvrir la
+      journée par un admin.
+    - 504 Gateway Timeout sur une facture PDF : proxy_read_timeout laissé au
+      défaut (60 s). Cf. §7.2.
+    - « UndefinedValueError: SECRET_KEY not found » au démarrage : .env absent
+      ou incomplet.
+    - « connection refused » vers la base au premier démarrage : normal
+      pendant quelques secondes, le backend attend le healthcheck de db. Si
+      cela persiste, DB_HOST doit valoir "db" — c'est compose.prod.yml qui
+      l'impose, une valeur DB_HOST=localhost restée dans .env est ignorée
+      pour le service backend mais pas dans un « docker compose run » ad hoc.
+    - Build très lent ou tué (OOM) : RAM insuffisante pour la compilation des
+      dépendances. Ajouter un swap :
+          sudo fallocate -l 2G /swapfile && sudo chmod 600 /swapfile
+          sudo mkswap /swapfile && sudo swapon /swapfile
+          echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+
+
+12. CONFIGURER LES CLIENTS (FRONTEND ET MOBILE)
+--------------------------------------------------------------------------------
+Le frontend Angular et l'application mobile pointent vers l'URL publique de
+cette API — c'est une DONNÉE DE DÉPLOIEMENT, côté dépôt client :
+
+    frontend Angular : src/environments/environment.prod.ts
+        apiUrl: 'https://api.mondomaine.com'
+    mobile : le fichier d'environnement de production de l'application
+        (équivalent de le_parrain_mobile/.env.development, qui pointe
+        aujourd'hui vers l'IP LAN du poste de dev ou un tunnel ngrok)
+
+Après tout changement de domaine côté client, mettre à jour
+EXTRA_CORS_ORIGINS et EXTRA_CSRF_ORIGINS côté backend (§4.4) — sinon le
+frontend se voit refuser ses requêtes alors que l'API fonctionne.
+
+Une fois le déploiement en HTTPS uniquement, deux nettoyages possibles dans
+le_parrain/settings.py (hors périmètre de ce guide, mais recommandés) :
+    - retirer ".ngrok-free.app" d'ALLOWED_HOSTS et de CSRF_TRUSTED_ORIGINS :
+      ce joker accepte n'importe quel tunnel ngrok, il n'a plus de raison
+      d'être en production ;
+    - retirer l'IP LAN codée en dur ("192.168.1.156").
+
+
+13. RÉCAPITULATIF SÉCURITÉ
+--------------------------------------------------------------------------------
+    - /!\ Le .env de développement est commité dans le dépôt, SECRET_KEY et
+      clé privée Ed25519 comprises. À traiter avant la mise en production :
+          git rm --cached .env
+          git commit -m "Retire .env du suivi git"
+      Les secrets restent dans l'historique : les considérer comme brûlés et
+      en générer de nouveaux pour la production (§4.1, §4.5). Idem pour
+      le_parrain_backup.sql et backups/*.sql, qui contiennent des données
+      réelles (clients, personnel, mots de passe hachés) :
+          git rm --cached le_parrain_backup.sql backups/*.sql
+      Un .gitignore couvrant .env, *.sql, media/ et staticfiles/ est fourni.
+    - DEBUG=False en production, sans exception.
+    - PostgreSQL n'est joignable que depuis le réseau interne de Compose :
+      aucun "ports:" sur le service db, 5432 fermé dans UFW.
+    - Gunicorn n'est joignable que via Nginx (127.0.0.1:8000) ; 8000 n'est pas
+      ouvert dans UFW.
+    - HTTPS obligatoire (certbot, redirection 80 -> 443).
+    - Aucune limitation de débit applicative sur les logins : la protection
+      anti-force-brute repose entièrement sur Nginx (§7.5).
+    - /admin/ et /api/console/ gouvernent respectivement toute la base et tous
+      les abonnements : les restreindre par IP (§7.5).
+    - CORS : la liste est explicite (pas de joker), la maintenir au strict
+      nécessaire dans EXTRA_CORS_ORIGINS.
+    - Les fichiers de /media/ sont servis par Nginx SANS authentification :
+      quiconque connaît l'URL d'une image y accède. Ne rien y stocker de
+      confidentiel. Les factures PDF, elles, sont générées à la volée et
+      passent par l'API authentifiée — ne pas changer cela.
+    - La clé privée Ed25519 est la racine de confiance des abonnements :
+      sauvegardée hors VPS, jamais dans le dépôt, jamais dans un ticket.
+    - Le conteneur backend tourne en root (Dockerfile sans directive USER) :
+      amélioration connue, à traiter côté image si le contexte l'exige.
+    - Les cookies de session/CSRF ne sont pas marqués Secure et
+      SECURE_PROXY_SSL_HEADER n'est pas défini. À ajouter dans
+      le_parrain/settings.py pour un déploiement HTTPS strict :
+          SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
+          SESSION_COOKIE_SECURE = True
+          CSRF_COOKIE_SECURE = True
+      (le frontend et le mobile utilisent des jetons DRF, non concernés ; ce
+      sont l'admin Django et la vue navigable DRF qui en dépendent).
+================================================================================
