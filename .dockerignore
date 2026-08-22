@@ -1,0 +1,8 @@
+.venv
+__pycache__
+**/__pycache__
+*.pyc
+.git
+.idea
+db.sqlite3
+le_parrain_backup.sql
