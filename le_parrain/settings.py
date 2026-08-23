@@ -205,3 +205,30 @@ MEDIA_ROOT = BASE_DIR / 'media'
 # https://docs.djangoproject.com/en/5.2/ref/settings/#default-auto-field
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
+
+# Sans ceci, Django masque les tracebacks des erreurs 500 PARTOUT en production (DEBUG=False) -
+# y compris dans les logs serveur (docker logs, stdout du process), pas seulement dans la
+# reponse HTTP renvoyee au client (masquage cote client volontaire, correct). Le handler
+# 'mail_admins' par defaut de Django ne s'active que si ADMINS+email sont configures (jamais
+# le cas ici) - sans handler 'console' explicite, une erreur 500 ne laisse absolument aucune
+# trace visible nulle part. Log toujours vers stdout, avec la traceback complete.
+LOGGING = {
+    'version': 1,
+    'disable_existing_loggers': False,
+    'handlers': {
+        'console': {
+            'class': 'logging.StreamHandler',
+        },
+    },
+    'root': {
+        'handlers': ['console'],
+        'level': 'INFO',
+    },
+    'loggers': {
+        'django.request': {
+            'handlers': ['console'],
+            'level': 'ERROR',
+            'propagate': False,
+        },
+    },
+}
