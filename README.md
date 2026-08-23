@@ -54,7 +54,7 @@ le-parrain-backend/
 
 ### 1. Cloner le projet
 
-git clone https://github.com/Essimbi/le-parrain-backend.git
+git clone 
 cd le-parrain-backend
 
 #### 2. Créer un environnement virtuel

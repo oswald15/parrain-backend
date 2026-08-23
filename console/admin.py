@@ -1,13 +1,41 @@
+from django import forms
 from django.contrib import admin
 
 from .models import Abonnement, CodeActivation, Editeur, EditeurToken, Formule, Journal, Paiement
 
 
+class EditeurAdminForm(forms.ModelForm):
+    """Le champ 'password' du modele n'est jamais affiche/edite directement (c'est un hash) -
+    ce formulaire ajoute un champ de saisie en clair distinct, hache par EditeurAdmin.save_model
+    avant tout enregistrement. Sans ca, creer/modifier un Editeur depuis /admin/ ne permettait
+    pas de definir un mot de passe utilisable."""
+    password = forms.CharField(
+        label='Mot de passe', widget=forms.PasswordInput, required=False,
+        help_text="Laisser vide pour ne pas changer le mot de passe d'un compte existant. "
+                   "Obligatoire pour qu'un nouveau compte soit utilisable.",
+    )
+
+    class Meta:
+        model = Editeur
+        fields = ('email', 'nom', 'is_active', 'password')
+
+
 @admin.register(Editeur)
 class EditeurAdmin(admin.ModelAdmin):
+    form = EditeurAdminForm
     list_display = ('email', 'nom', 'is_active', 'cree_le')
     search_fields = ('email', 'nom')
-    readonly_fields = ('password', 'last_login', 'cree_le')
+    readonly_fields = ('cree_le',)
+
+    def save_model(self, request, obj, form, change):
+        raw_password = form.cleaned_data.get('password')
+        if raw_password:
+            obj.set_password(raw_password)
+        elif not change:
+            # Nouveau compte cree sans mot de passe fourni : marque comme inutilisable plutot
+            # que de sauvegarder un hash vide silencieusement exploitable.
+            obj.set_unusable_password()
+        obj.save()
 
 
 @admin.register(EditeurToken)
