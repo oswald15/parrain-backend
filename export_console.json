@@ -1,0 +1,92 @@
+[
+{
+  "model": "console.editeur",
+  "pk": "44e163a8-19b8-46ba-9abb-8b420ce16d36",
+  "fields": {
+    "password": "pbkdf2_sha256$1200000$LXGLudd4sgKodM80fGJ5jS$9WqvsYq2kPmEPAQ7lxLiaF9E7bUkvO3Xxpfvw5qUi7Y=",
+    "last_login": null,
+    "nom": "Editeur",
+    "email": "editeur@le-parrain.local",
+    "is_active": true,
+    "cree_le": "2026-08-20T12:39:28.002Z"
+  }
+},
+{
+  "model": "console.formule",
+  "pk": "0c5072e0-8914-4fb6-9aed-ea5e6ae211c8",
+  "fields": {
+    "libelle": "Trimestriel",
+    "duree_jours": 90,
+    "montant_xaf": 40000,
+    "active": true
+  }
+},
+{
+  "model": "console.formule",
+  "pk": "6bdc5603-ba53-4bbf-ab8f-0f5034ab06bf",
+  "fields": {
+    "libelle": "Annuel",
+    "duree_jours": 365,
+    "montant_xaf": 150000,
+    "active": true
+  }
+},
+{
+  "model": "console.formule",
+  "pk": "d2d695c9-d632-4351-b6c7-d7cd5b87575e",
+  "fields": {
+    "libelle": "Mensuel",
+    "duree_jours": 30,
+    "montant_xaf": 15000,
+    "active": true
+  }
+},
+{
+  "model": "console.codeactivation",
+  "pk": "b80d0533-19d3-4fbe-9368-7e92b0b32bab",
+  "fields": {
+    "organisation": "11111111-1111-1111-1111-111111111111",
+    "formule": "d2d695c9-d632-4351-b6c7-d7cd5b87575e",
+    "empreinte": "5e8d154e163fee7e60adba49d193b40c00345b676ad3a7010818362cc506b941",
+    "numero_serie": "AC-K9ZF4G3P",
+    "duree_jours": 30,
+    "emis_le": "2026-08-20T17:19:43.069Z",
+    "emis_par": "44e163a8-19b8-46ba-9abb-8b420ce16d36",
+    "expire_le": "2026-09-19T17:19:43.069Z",
+    "utilise_le": "2026-08-20T17:19:55.309Z",
+    "signature": "fmh1F4VSqh0Db9Pxmnnylxf2Z5ouBb0GSrF0mQcWZHZUpkFbJml0Igwdx2e6wuCXSoS2iYZ0MMtPkUT0Al1qCA==",
+    "statut": "utilise"
+  }
+},
+{
+  "model": "console.codeactivation",
+  "pk": "f00ccb1c-fe18-4fcf-b475-94f4a3166206",
+  "fields": {
+    "organisation": "11111111-1111-1111-1111-111111111111",
+    "formule": "d2d695c9-d632-4351-b6c7-d7cd5b87575e",
+    "empreinte": "602a4c7b4e3dcd332d3cf16661d7615978b349189f774caa49e63f6285cadf5f",
+    "numero_serie": "AC-BY76L7PG",
+    "duree_jours": 30,
+    "emis_le": "2026-08-20T16:44:17.205Z",
+    "emis_par": "44e163a8-19b8-46ba-9abb-8b420ce16d36",
+    "expire_le": "2026-09-19T16:44:17.205Z",
+    "utilise_le": null,
+    "signature": "Qpi2OmCkzNAvYeA8m9zu2MvCOCzB5+SzSZiGNhC3/YtOxJUCyjBJU8irma1F73fPXT6zK8548TkVXiY5iN8SDg==",
+    "statut": "actif"
+  }
+},
+{
+  "model": "console.abonnement",
+  "pk": "dfe89a23-f47d-47cb-be87-eeaf8140ed3f",
+  "fields": {
+    "organisation": "11111111-1111-1111-1111-111111111111",
+    "formule": "d2d695c9-d632-4351-b6c7-d7cd5b87575e",
+    "date_debut": "2026-08-20T17:19:55.309Z",
+    "date_expiration": "2026-09-19T17:19:55.309Z",
+    "montant_xaf": 15000,
+    "statut": "en_cours",
+    "ouvert_par_code": "b80d0533-19d3-4fbe-9368-7e92b0b32bab",
+    "cree_le": "2026-08-20T17:19:55.315Z"
+  }
+}
+]

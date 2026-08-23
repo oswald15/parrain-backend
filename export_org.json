@@ -1,0 +1,20 @@
+[
+{
+  "model": "organisations.organisation",
+  "pk": "11111111-1111-1111-1111-111111111111",
+  "fields": {
+    "name": "Bar Le Parrain",
+    "description": "Bar principal du groupe",
+    "address": "12 avenue de la Paix, Douala",
+    "ville": null,
+    "phone_contact": "+237690000001",
+    "subscription_plan": "premium",
+    "supadmin": null,
+    "statut": "active",
+    "archivee": false,
+    "derniere_activite_le": "2026-08-22T21:41:27.525Z",
+    "created_at": "2026-07-24T16:27:32.409Z",
+    "updated_at": "2026-07-24T16:27:32.409Z"
+  }
+}
+]
