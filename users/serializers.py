@@ -1,6 +1,7 @@
 from rest_framework import serializers
 from django.contrib.auth.models import Permission
 from .models import User
+from .phone import normalize_phone
 from django.contrib.auth import authenticate
 
 class UserSerializer(serializers.ModelSerializer):
@@ -19,7 +20,11 @@ class LoginSerializer(serializers.Serializer):
     device_date = serializers.DateTimeField(required=False, allow_null=True, write_only=True)
 
     def validate(self, data):
-        user = authenticate(phone=data.get('phone'), password=data.get('password'))
+        # Meme si un compte a ete cree avec un numero mal normalise (corrige a la source
+        # ci-dessous), tolerer les variantes de saisie au login est une defense en profondeur
+        # peu couteuse.
+        phone = normalize_phone(data.get('phone', ''))
+        user = authenticate(phone=phone, password=data.get('password'))
         if not user:
             raise serializers.ValidationError("Identifiants invalides")
         data['user'] = user
@@ -65,6 +70,9 @@ class UserCreateSerializer(serializers.ModelSerializer):
             'assigned_cashier',
         ]
 
+    def validate_phone(self, value):
+        return normalize_phone(value)
+
     def validate_role(self, value):
         request = self.context.get('request')
         creator = request.user if request else None
@@ -96,6 +104,9 @@ class UserUpdateSerializer(serializers.ModelSerializer):
             'id', 'name', 'phone', 'role', 'departments', 'can_transfer_stock', 'is_active',
             'assigned_cashier',
         ]
+
+    def validate_phone(self, value):
+        return normalize_phone(value)
 
     def validate_role(self, value):
         request = self.context.get('request')

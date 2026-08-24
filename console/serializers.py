@@ -124,6 +124,12 @@ class SuperadminCreateSerializer(serializers.Serializer):
 
     def validate_phone(self, value):
         from users.models import User
+        from users.phone import normalize_phone
+        # Sans cette normalisation, un numero saisi ici sans indicatif pays (ex. '674510170')
+        # ne correspond jamais a ce que le frontend envoie au login (toujours '+237674510170',
+        # voir AuthService.normalizePhone) - le compte reste bloque avec 'Identifiants
+        # invalides' quel que soit le mot de passe, indefiniment. Bug reel rencontre en prod.
+        value = normalize_phone(value)
         if User.objects.filter(phone=value).exists():
             raise serializers.ValidationError('Ce numéro de téléphone est déjà utilisé.')
         return value
