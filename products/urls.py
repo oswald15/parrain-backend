@@ -6,7 +6,9 @@ from .views import (
     CategoryListCreateView, CategoryRetrieveUpdateDestroyView,
     DepartmentStockListView, DepartmentStockAssignView,
     StockMovementListView, StockReceptionView, StockTransferView,
-    PurchaseOrderListCreateView, AvarieCreateView
+    PurchaseOrderListCreateView, AvarieCreateView,
+    InventoryListCreateView, InventoryDetailView, InventoryValidateView,
+    InventoryDepartmentProfitabilityView,
 )
 
 urlpatterns = [
@@ -28,4 +30,8 @@ urlpatterns = [
     path('categories/<uuid:pk>/', CategoryRetrieveUpdateDestroyView.as_view(), name='category-detail'),
     path('purchase-orders/', PurchaseOrderListCreateView.as_view(), name='purchase-order-list-create'),
     path('avaries/', AvarieCreateView.as_view(), name='avarie-list-create'),
+    path('inventories/', InventoryListCreateView.as_view(), name='inventory-list-create'),
+    path('inventories/<uuid:pk>/', InventoryDetailView.as_view(), name='inventory-detail'),
+    path('inventories/<uuid:pk>/validate/', InventoryValidateView.as_view(), name='inventory-validate'),
+    path('inventories/rentability/<uuid:department_id>/', InventoryDepartmentProfitabilityView.as_view(), name='inventory-department-profitability'),
 ]

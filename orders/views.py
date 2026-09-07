@@ -22,6 +22,7 @@ from rest_framework.response import Response
 from django.db.models import Sum, Count
 from django.utils.dateparse import parse_date
 from django.db.models import Sum, F
+from decimal import Decimal
 
 
 def parse_date_param(value):
@@ -415,19 +416,6 @@ class DepartmentProfitabilityReportView(APIView):
         end_date = parse_date_param(request.query_params.get('end_date')) or start_date
         department = request.query_params.get('department')
 
-        stock_qs = DepartmentStock.objects.filter(organisation=organisation)
-        if department:
-            stock_qs = stock_qs.filter(department_id=department)
-
-        stock_by_department = (
-            stock_qs.values('department__id', 'department__name')
-            .annotate(
-                stock_value=Sum(F('quantity') * F('weighted_average_cost')),
-                potential_sale_value=Sum(F('quantity') * F('sale_price')),
-            )
-            .order_by('department__name')
-        )
-
         sales_qs = Transaction.objects.filter(
             organisation=organisation,
             transaction_type='sortie_vente',
@@ -436,30 +424,45 @@ class DepartmentProfitabilityReportView(APIView):
         )
         if department:
             sales_qs = sales_qs.filter(department_id=department)
-        sales_by_department = {
-            row['department_id']: row
-            for row in sales_qs.values('department_id').annotate(
-                sold_quantity=Sum('quantity'),
-                sold_amount=Sum('amount'),
-            )
-        }
+        sales_by_product = {}
+        for row in sales_qs.values('department_id', 'product_id').annotate(
+            sold_quantity=Sum('quantity'), sold_amount=Sum('amount')
+        ):
+            sales_by_product[(row['department_id'], row['product_id'])] = row
 
         report = []
-        for row in stock_by_department:
-            stock_value = row['stock_value'] or 0
-            potential_sale_value = row['potential_sale_value'] or 0
-            margin = potential_sale_value - stock_value
+        departments = Department.objects.filter(organisation=organisation)
+        if department:
+            departments = departments.filter(id=department)
+        for current_department in departments.order_by('name'):
+            stocks = DepartmentStock.objects.filter(department=current_department)
+            stock_value = sum((stock.quantity * stock.weighted_average_cost for stock in stocks), Decimal('0'))
+            potential_sale_value = sum((stock.quantity * stock.sale_price for stock in stocks), Decimal('0'))
+            expected_benefit = potential_sale_value - stock_value
+            realized_benefit = Decimal('0')
+            sold_quantity = 0
+            sold_amount = Decimal('0')
+            for stock in stocks:
+                sale = sales_by_product.get((current_department.id, stock.product_id))
+                if sale:
+                    quantity = sale['sold_quantity'] or 0
+                    amount = sale['sold_amount'] or Decimal('0')
+                    sold_quantity += quantity
+                    sold_amount += amount
+                    realized_benefit += amount - (quantity * stock.weighted_average_cost)
+            margin = expected_benefit
             margin_percent = (margin / stock_value * 100) if stock_value else 0
-            sales = sales_by_department.get(row['department__id'], {})
             report.append({
-                'department_id': row['department__id'],
-                'department_name': row['department__name'],
+                'department_id': current_department.id,
+                'department_name': current_department.name,
                 'stock_value': stock_value,
                 'potential_sale_value': potential_sale_value,
                 'margin': margin,
+                'expected_benefit': expected_benefit,
+                'realized_benefit': realized_benefit,
                 'margin_percent': margin_percent,
-                'sold_quantity': sales.get('sold_quantity') or 0,
-                'sold_amount': sales.get('sold_amount') or 0,
+                'sold_quantity': sold_quantity,
+                'sold_amount': sold_amount,
             })
 
         return Response({

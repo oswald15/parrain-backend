@@ -16,7 +16,7 @@ import uuid
 from decimal import Decimal, InvalidOperation
 from .models import (
     Product, StockRequest, Category, DepartmentStock, StockMovement, PurchaseOrder, Avarie,
-    BudgetRequest,
+    BudgetRequest, Inventory, InventoryLine,
 )
 from organisations.models import Department
 from orders.models import Transaction
@@ -25,6 +25,7 @@ from .serializers import (
     DepartmentStockSerializer, StockMovementSerializer,
     StockReceptionSerializer, StockTransferSerializer,
     PurchaseOrderSerializer, AvarieSerializer, BudgetRequestSerializer,
+    InventorySerializer,
 )
 from .permissions import IsAdminOrApprovisionneur, IsAdminOnly, IsAdminOrSuperAdmin
 
@@ -118,6 +119,12 @@ class DepartmentStockListView(generics.ListAPIView):
             queryset = queryset.filter(department_id=department)
         if self.request.user.role == 'approvisionneur':
             queryset = queryset.filter(department__in=self.request.user.departments.all())
+
+        for stock in queryset:
+            if stock.product.shared_stock:
+                stock.quantity = stock.product.stock_quantity
+                stock.save(update_fields=['quantity'])
+
         return queryset
 
 class DepartmentStockAssignView(APIView):
@@ -147,15 +154,21 @@ class DepartmentStockAssignView(APIView):
             product=product,
             defaults={
                 'family': product.category,
-                'quantity': 0,
+                'quantity': product.stock_quantity if product.shared_stock else 0,
                 'weighted_average_cost': product.purchase_price,
                 'sale_price': sale_price,
                 'min_threshold': product.min_threshold,
             }
         )
-        if not created:
+        if product.shared_stock:
+            stock.quantity = product.stock_quantity
             stock.sale_price = sale_price
-            stock.save()
+            stock.save(update_fields=['quantity', 'sale_price'])
+            product.sync_shared_stock_to_departments()
+        else:
+            if not created:
+                stock.sale_price = sale_price
+                stock.save()
 
         return Response(
             DepartmentStockSerializer(stock).data,
@@ -184,10 +197,6 @@ class StockReceptionView(APIView):
         serializer = StockReceptionSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
-        department = get_object_or_404(Department, id=data['department'], organisation=request.user.organisation)
-        if request.user.role == 'approvisionneur' and department not in request.user.departments.all():
-            return Response({'detail': 'Departement non attribue.'}, status=status.HTTP_403_FORBIDDEN)
-
         reception_cost = data['quantity'] * data['unit_purchase_price']
         if request.user.role == 'approvisionneur' and reception_cost > request.user.available_budget:
             return Response(
@@ -196,36 +205,65 @@ class StockReceptionView(APIView):
             )
 
         product = get_object_or_404(Product, id=data['product'], organisation=request.user.organisation)
+        department = None
+        if not product.shared_stock:
+            if not data.get('department'):
+                return Response(
+                    {'detail': 'Ce produit doit etre approvisionne dans un departement.'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            department = get_object_or_404(
+                Department, id=data['department'], organisation=request.user.organisation
+            )
+            if request.user.role == 'approvisionneur' and department not in request.user.departments.all():
+                return Response({'detail': 'Departement non attribue.'}, status=status.HTTP_403_FORBIDDEN)
+
         family = product.category
         explicit_sale_price = data.get('unit_sale_price')
-        stock, created = DepartmentStock.objects.get_or_create(
-            organisation=request.user.organisation,
-            department=department,
-            product=product,
-            defaults={
-                'family': family,
-                'quantity': 0,
-                'weighted_average_cost': data['unit_purchase_price'],
-                'sale_price': explicit_sale_price or product.price,
-                'min_threshold': product.min_threshold,
-            }
-        )
-        # Ne jamais ecraser un prix de vente departement deja configure (ex. via
-        # DepartmentStockAssignView) si la reception n'en fournit pas explicitement un nouveau.
-        sale_price = explicit_sale_price if explicit_sale_price is not None else stock.sale_price
+        stock = None
+        sale_price = explicit_sale_price or product.price
+        if department:
+            stock, _ = DepartmentStock.objects.get_or_create(
+                organisation=request.user.organisation,
+                department=department,
+                product=product,
+                defaults={
+                    'family': family,
+                    'quantity': product.stock_quantity if product.shared_stock else 0,
+                    'weighted_average_cost': data['unit_purchase_price'],
+                    'sale_price': sale_price,
+                    'min_threshold': product.min_threshold,
+                }
+            )
+            if explicit_sale_price is None:
+                sale_price = stock.sale_price
 
-        old_value = stock.quantity * stock.weighted_average_cost
-        incoming_value = data['quantity'] * data['unit_purchase_price']
-        new_quantity = stock.quantity + data['quantity']
-        stock.weighted_average_cost = (old_value + incoming_value) / new_quantity
-        if family:
-            stock.family = family
-        stock.quantity = new_quantity
-        stock.sale_price = sale_price
-        stock.save()
+        if product.shared_stock:
+            old_quantity = product.stock_quantity
+            new_quantity = old_quantity + data['quantity']
+            old_value = old_quantity * product.purchase_price
+            incoming_value = data['quantity'] * data['unit_purchase_price']
+            product.purchase_price = (old_value + incoming_value) / new_quantity
+            product.stock_quantity += data['quantity']
+            product.save()
+            product.sync_shared_stock_to_departments()
+            if stock:
+                stock.quantity = product.stock_quantity
+                stock.sale_price = sale_price
+                stock.save(update_fields=['quantity', 'sale_price'])
+        else:
+            old_value = stock.quantity * stock.weighted_average_cost
+            incoming_value = data['quantity'] * data['unit_purchase_price']
+            new_quantity = stock.quantity + data['quantity']
+            stock.weighted_average_cost = (old_value + incoming_value) / new_quantity
+            if family:
+                stock.family = family
+            stock.quantity = new_quantity
+            stock.sale_price = sale_price
+            stock.save()
 
-        product.stock_quantity = sum(item.quantity for item in product.department_stocks.all())
-        product.save()
+            product.stock_quantity = sum(item.quantity for item in product.department_stocks.all())
+            product.save()
 
         movement = StockMovement.objects.create(
             organisation=request.user.organisation,
@@ -274,9 +312,16 @@ class StockTransferView(APIView):
         serializer = StockTransferSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
+        product = get_object_or_404(Product, id=data['product'], organisation=request.user.organisation)
+
+        if product.shared_stock:
+            return Response(
+                {'detail': 'Le transfert entre départements est désactivé en mode stock global.'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
         source = get_object_or_404(Department, id=data['source_department'], organisation=request.user.organisation)
         destination = get_object_or_404(Department, id=data['destination_department'], organisation=request.user.organisation)
-        product = get_object_or_404(Product, id=data['product'], organisation=request.user.organisation)
 
         if request.user.role == 'approvisionneur':
             allowed = request.user.departments.all()
@@ -304,8 +349,6 @@ class StockTransferView(APIView):
         source_stock.save()
         destination_stock.quantity += data['quantity']
         destination_stock.weighted_average_cost = source_stock.weighted_average_cost
-        # Ne pas ecraser un prix de vente deja configure sur le departement destination
-        # (ex. via DepartmentStockAssignView) : uniquement applique a la creation.
         if destination_stock.sale_price in (None, 0):
             destination_stock.sale_price = source_stock.sale_price
         destination_stock.save()
@@ -362,6 +405,7 @@ class StockRequestApproveView(generics.UpdateAPIView):
         instance = serializer.save(status='approved')
         instance.product.stock_quantity += instance.requested_quantity
         instance.product.save()
+        instance.product.sync_shared_stock_to_departments()
 
 class MyBudgetView(APIView):
     """Solde disponible de l'approvisionneur connecte, a jour (contrairement aux donnees
@@ -448,6 +492,180 @@ class BudgetRequestRejectView(APIView):
         return Response(BudgetRequestSerializer(budget_request).data)
 
 
+class InventoryListCreateView(generics.ListCreateAPIView):
+    serializer_class = InventorySerializer
+    permission_classes = [permissions.IsAuthenticated, IsAdminOrApprovisionneur]
+
+    def get_queryset(self):
+        return Inventory.objects.filter(
+            organisation=self.request.user.organisation
+        ).prefetch_related('lines__product__category', 'lines__department')
+
+    @transaction.atomic
+    def perform_create(self, serializer):
+        if self.request.user.role != 'approvisionneur':
+            raise PermissionDenied('Seul un approvisionneur peut creer un inventaire.')
+        inventory = serializer.save(
+            organisation=self.request.user.organisation,
+            created_by=self.request.user,
+            status='en_attente',
+        )
+        products = Product.objects.filter(
+            organisation=self.request.user.organisation, is_active=True
+        ).select_related('category')
+        for product in products:
+            if product.shared_stock:
+                InventoryLine.objects.create(
+                    inventory=inventory,
+                    product=product,
+                    system_quantity=product.stock_quantity,
+                    purchase_price=product.purchase_price,
+                    sale_price=product.price,
+                )
+                continue
+            stocks = DepartmentStock.objects.filter(product=product).select_related('department')
+            for stock in stocks:
+                InventoryLine.objects.create(
+                    inventory=inventory,
+                    product=product,
+                    department=stock.department,
+                    system_quantity=stock.quantity,
+                    purchase_price=stock.weighted_average_cost,
+                    sale_price=stock.sale_price,
+                )
+
+
+class InventoryDetailView(generics.RetrieveUpdateAPIView):
+    serializer_class = InventorySerializer
+    permission_classes = [permissions.IsAuthenticated, IsAdminOrApprovisionneur]
+    http_method_names = ['get', 'patch', 'head', 'options']
+
+    def get_queryset(self):
+        return Inventory.objects.filter(
+            organisation=self.request.user.organisation
+        ).prefetch_related('lines__product__category', 'lines__department')
+
+    @transaction.atomic
+    def partial_update(self, request, *args, **kwargs):
+        inventory = self.get_object()
+        if inventory.status == 'valide':
+            return Response({'detail': 'Cet inventaire est deja valide.'}, status=status.HTTP_400_BAD_REQUEST)
+        valuation_mode = request.data.get('valuation_mode')
+        if valuation_mode is not None:
+            if valuation_mode not in dict(Inventory.VALUATION_CHOICES):
+                return Response({'valuation_mode': 'Mode de valorisation invalide.'}, status=status.HTTP_400_BAD_REQUEST)
+            inventory.valuation_mode = valuation_mode
+            inventory.save(update_fields=['valuation_mode'])
+        lines = request.data.get('lines', [])
+        if lines and not isinstance(lines, list):
+            return Response({'lines': 'Une liste de quantites est attendue.'}, status=status.HTTP_400_BAD_REQUEST)
+        for item in lines or []:
+            try:
+                line = inventory.lines.get(id=item['id'])
+                quantity = int(item['physical_quantity'])
+            except (KeyError, TypeError, ValueError, InventoryLine.DoesNotExist):
+                return Response({'lines': 'Ligne ou quantite invalide.'}, status=status.HTTP_400_BAD_REQUEST)
+            if quantity < 0:
+                return Response({'lines': 'La quantite physique ne peut pas etre negative.'}, status=status.HTTP_400_BAD_REQUEST)
+            line.physical_quantity = quantity
+            line.save(update_fields=['physical_quantity'])
+        inventory.status = 'en_attente'
+        inventory.save(update_fields=['status'])
+        return Response(InventorySerializer(inventory).data)
+
+
+class InventoryValidateView(APIView):
+    permission_classes = [permissions.IsAuthenticated, IsAdminOnly]
+
+    @transaction.atomic
+    def post(self, request, pk):
+        inventory = get_object_or_404(
+            Inventory.objects.prefetch_related('lines'),
+            id=pk,
+            organisation=request.user.organisation,
+        )
+        if inventory.status == 'valide':
+            return Response({'detail': 'Cet inventaire est deja valide.'}, status=status.HTTP_400_BAD_REQUEST)
+        lines = list(inventory.lines.select_related('product'))
+        if any(line.physical_quantity is None for line in lines):
+            return Response({'detail': 'Toutes les quantites physiques doivent etre saisies.'}, status=status.HTTP_400_BAD_REQUEST)
+        touched_products = set()
+        for line in lines:
+            if line.department_id is None:
+                line.product.stock_quantity = line.physical_quantity
+                line.product.save(update_fields=['stock_quantity'])
+                line.product.sync_shared_stock_to_departments()
+                touched_products.add(line.product_id)
+            else:
+                DepartmentStock.objects.filter(
+                    department_id=line.department_id, product_id=line.product_id
+                ).update(quantity=line.physical_quantity)
+                touched_products.add(line.product_id)
+        for product_id in touched_products:
+            product = Product.objects.get(id=product_id)
+            if not product.shared_stock:
+                product.stock_quantity = sum(
+                    stock.quantity for stock in product.department_stocks.all()
+                )
+                product.save(update_fields=['stock_quantity'])
+        inventory.status = 'valide'
+        inventory.validated_by = request.user
+        inventory.validated_at = timezone.now()
+        inventory.save(update_fields=['status', 'validated_by', 'validated_at'])
+        return Response(InventorySerializer(inventory).data)
+
+
+class InventoryDepartmentProfitabilityView(APIView):
+    permission_classes = [permissions.IsAuthenticated, IsAdminOnly]
+
+    def get(self, request, department_id):
+        department = get_object_or_404(Department, id=department_id, organisation=request.user.organisation)
+        sales = Transaction.objects.filter(
+            organisation=request.user.organisation,
+            department=department,
+            transaction_type='sortie_vente',
+            product__isnull=False,
+        ).values('product_id').annotate(
+            sold_quantity=models.Sum('quantity'),
+            sold_amount=models.Sum('amount'),
+        )
+        sales_by_product = {row['product_id']: row for row in sales}
+        stocks = DepartmentStock.objects.filter(
+            organisation=request.user.organisation,
+            department=department,
+        ).select_related('product', 'product__category')
+        result = []
+        expected_benefit = Decimal('0')
+        realized_benefit = Decimal('0')
+        for stock in stocks:
+            sale = sales_by_product.get(stock.product_id)
+            margin = stock.sale_price - stock.weighted_average_cost
+            expected_benefit += stock.quantity * margin
+            quantity = (sale or {}).get('sold_quantity') or 0
+            sold_amount = (sale or {}).get('sold_amount') or Decimal('0')
+            realized_benefit += sold_amount - (quantity * stock.weighted_average_cost)
+            result.append({
+                'product': stock.product_id,
+                'code': stock.product.code,
+                'name': stock.product.name,
+                'image': stock.product.image_url,
+                'family': stock.product.category.name if stock.product.category else None,
+                'sold_quantity': quantity,
+                'cmp': stock.weighted_average_cost,
+                'sale_price': stock.sale_price,
+                'margin': margin,
+                'benefit': margin * quantity,
+            })
+        return Response({
+            'department': str(department.id),
+            'department_name': department.name,
+            'expected_benefit': expected_benefit,
+            'realized_benefit': realized_benefit,
+            'benefit': expected_benefit,
+            'products': result,
+        })
+
+
 class CategoryListCreateView(generics.ListCreateAPIView):
     serializer_class = CategorySerializer
 
@@ -527,17 +745,30 @@ class AvarieCreateView(generics.ListCreateAPIView):
         if self.request.user.role == 'approvisionneur' and department not in self.request.user.departments.all():
             raise PermissionDenied('Departement non attribue.')
 
-        stock = get_object_or_404(DepartmentStock, department=department, product=product)
-        if stock.quantity < quantity:
-            raise ValidationError({'quantity': 'Stock insuffisant pour declarer cette avarie.'})
+        if product.shared_stock:
+            if product.stock_quantity < quantity:
+                raise ValidationError({'quantity': 'Stock insuffisant pour declarer cette avarie.'})
+            product.stock_quantity -= quantity
+            product.save()
+            product.sync_shared_stock_to_departments()
+        else:
+            stock = get_object_or_404(DepartmentStock, department=department, product=product)
+            if stock.quantity < quantity:
+                raise ValidationError({'quantity': 'Stock insuffisant pour declarer cette avarie.'})
 
-        stock.quantity -= quantity
-        stock.save()
+            stock.quantity -= quantity
+            stock.save()
 
-        product.stock_quantity = sum(item.quantity for item in product.department_stocks.all())
-        product.save()
+            product.stock_quantity = sum(item.quantity for item in product.department_stocks.all())
+            product.save()
 
         avarie = serializer.save(organisation=self.request.user.organisation, author=self.request.user)
+
+        if product.shared_stock:
+            unit_price = product.purchase_price or 0
+        else:
+            stock = get_object_or_404(DepartmentStock, department=department, product=product)
+            unit_price = stock.weighted_average_cost
 
         StockMovement.objects.create(
             organisation=self.request.user.organisation,
@@ -546,7 +777,7 @@ class AvarieCreateView(generics.ListCreateAPIView):
             product=product,
             movement_type='avarie',
             quantity=quantity,
-            unit_purchase_price=stock.weighted_average_cost,
+            unit_purchase_price=unit_price,
             author=self.request.user,
             note=avarie.note
         )
@@ -557,6 +788,6 @@ class AvarieCreateView(generics.ListCreateAPIView):
             transaction_type='avaries',
             number=str(avarie.id),
             quantity=quantity,
-            amount=quantity * stock.weighted_average_cost,
+            amount=quantity * unit_price,
             author=self.request.user,
         )

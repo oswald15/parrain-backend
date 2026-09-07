@@ -27,9 +27,21 @@ class Product(models.Model):
     is_active = models.BooleanField(default=True)
     is_consignable = models.BooleanField(default=False)
     deposit_amount = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+    shared_stock = models.BooleanField(default=False)
 
     def is_below_threshold(self):
         return self.stock_quantity < self.min_threshold
+
+    def sync_shared_stock_to_departments(self):
+        if not self.shared_stock:
+            return
+        DepartmentStock.objects.filter(
+            organisation=self.organisation,
+            product=self,
+        ).update(
+            quantity=self.stock_quantity,
+            weighted_average_cost=self.purchase_price,
+        )
 
     @property
     def margin(self):
@@ -137,7 +149,9 @@ class StockMovement(models.Model):
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     organisation = models.ForeignKey(Organisation, on_delete=models.CASCADE)
-    department = models.ForeignKey(Department, on_delete=models.CASCADE, related_name='stock_movements')
+    department = models.ForeignKey(
+        Department, on_delete=models.SET_NULL, null=True, blank=True, related_name='stock_movements'
+    )
     family = models.ForeignKey(
         Category,
         on_delete=models.SET_NULL,
@@ -205,3 +219,55 @@ class Avarie(models.Model):
 
     class Meta:
         ordering = ['-created_at']
+
+class Inventory(models.Model):
+    STATUS_CHOICES = [
+        ('brouillon', 'Brouillon'),
+        ('en_attente', 'En attente de validation'),
+        ('valide', 'Valide'),
+    ]
+    VALUATION_CHOICES = [
+        ('achat', "Prix d'achat"),
+        ('vente', 'Prix de vente'),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    organisation = models.ForeignKey(Organisation, on_delete=models.CASCADE)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='brouillon')
+    valuation_mode = models.CharField(max_length=10, choices=VALUATION_CHOICES, default='achat')
+    created_by = models.ForeignKey('users.User', on_delete=models.SET_NULL, null=True, related_name='inventories_created')
+    validated_by = models.ForeignKey(
+        'users.User', on_delete=models.SET_NULL, null=True, blank=True, related_name='inventories_validated'
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    validated_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+
+class InventoryLine(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    inventory = models.ForeignKey(Inventory, on_delete=models.CASCADE, related_name='lines')
+    product = models.ForeignKey(Product, on_delete=models.CASCADE)
+    department = models.ForeignKey(Department, on_delete=models.SET_NULL, null=True, blank=True)
+    system_quantity = models.IntegerField()
+    physical_quantity = models.IntegerField(null=True, blank=True)
+    purchase_price = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+    sale_price = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+
+    @property
+    def difference(self):
+        if self.physical_quantity is None:
+            return None
+        return self.physical_quantity - self.system_quantity
+
+    @property
+    def unit_price(self):
+        return self.purchase_price if self.inventory.valuation_mode == 'achat' else self.sale_price
+
+    @property
+    def valuation(self):
+        if self.difference is None:
+            return None
+        return self.difference * self.unit_price

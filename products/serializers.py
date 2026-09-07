@@ -1,6 +1,9 @@
 from rest_framework import serializers
 from decimal import Decimal
-from .models import Product, StockRequest, Category, DepartmentStock, StockMovement, PurchaseOrder, Avarie, BudgetRequest
+from .models import (
+    Product, StockRequest, Category, DepartmentStock, StockMovement, PurchaseOrder, Avarie,
+    BudgetRequest, Inventory, InventoryLine,
+)
 
 class CategorySerializer(serializers.ModelSerializer):
     class Meta:
@@ -26,7 +29,7 @@ class ProductSerializer(serializers.ModelSerializer):
             'id', 'code', 'name', 'description', 'purchase_price', 'price',
             'margin', 'margin_percent', 'image_url', 'stock_quantity',
             'min_threshold', 'unit', 'category', 'category_id', 'is_below_threshold',
-            'is_active', 'is_consignable', 'deposit_amount'
+            'is_active', 'is_consignable', 'deposit_amount', 'shared_stock'
         ]
 
     def validate(self, attrs):
@@ -96,13 +99,53 @@ class StockMovementSerializer(serializers.ModelSerializer):
         read_only_fields = ['organisation', 'author', 'created_at']
 
 class StockReceptionSerializer(serializers.Serializer):
-    department = serializers.UUIDField()
+    department = serializers.UUIDField(required=False, allow_null=True)
     product = serializers.UUIDField()
     quantity = serializers.IntegerField(min_value=1)
     unit_purchase_price = serializers.DecimalField(max_digits=10, decimal_places=2)
     unit_sale_price = serializers.DecimalField(max_digits=10, decimal_places=2, required=False)
     purchase_order = serializers.UUIDField(required=False, allow_null=True)
     note = serializers.CharField(required=False, allow_blank=True)
+
+
+class InventoryLineSerializer(serializers.ModelSerializer):
+    product_code = serializers.ReadOnlyField(source='product.code')
+    product_name = serializers.ReadOnlyField(source='product.name')
+    family_name = serializers.ReadOnlyField(source='product.category.name')
+    image = serializers.ReadOnlyField(source='product.image_url')
+    department_name = serializers.ReadOnlyField(source='department.name')
+    difference = serializers.ReadOnlyField()
+    unit_price = serializers.ReadOnlyField()
+    valuation = serializers.ReadOnlyField()
+
+    class Meta:
+        model = InventoryLine
+        fields = [
+            'id', 'product', 'product_code', 'product_name', 'family_name', 'image',
+            'department', 'department_name', 'system_quantity', 'physical_quantity',
+            'difference', 'purchase_price', 'sale_price', 'unit_price', 'valuation',
+        ]
+        read_only_fields = [
+            'product_code', 'product_name', 'family_name', 'image', 'department_name',
+            'system_quantity', 'difference', 'purchase_price', 'sale_price', 'unit_price', 'valuation',
+        ]
+
+
+class InventorySerializer(serializers.ModelSerializer):
+    lines = InventoryLineSerializer(many=True, read_only=True)
+    created_by_name = serializers.ReadOnlyField(source='created_by.name')
+    validated_by_name = serializers.ReadOnlyField(source='validated_by.name')
+
+    class Meta:
+        model = Inventory
+        fields = [
+            'id', 'organisation', 'status', 'valuation_mode', 'created_by', 'created_by_name',
+            'validated_by', 'validated_by_name', 'created_at', 'validated_at', 'lines',
+        ]
+        read_only_fields = [
+            'organisation', 'status', 'created_by', 'created_by_name', 'validated_by',
+            'validated_by_name', 'created_at', 'validated_at', 'lines',
+        ]
 
 class StockTransferSerializer(serializers.Serializer):
     source_department = serializers.UUIDField()
