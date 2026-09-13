@@ -239,12 +239,17 @@ class StockReceptionView(APIView):
                 sale_price = stock.sale_price
 
         if product.shared_stock:
-            old_quantity = product.stock_quantity
+            shared_stock_rows = DepartmentStock.objects.filter(
+                organisation=request.user.organisation,
+                product=product,
+            )
+            shared_base_quantity = shared_stock_rows.aggregate(total=models.Sum('quantity'))['total'] or 0
+            old_quantity = shared_base_quantity if shared_stock_rows.exists() else product.stock_quantity
             new_quantity = old_quantity + data['quantity']
             old_value = old_quantity * product.purchase_price
             incoming_value = data['quantity'] * data['unit_purchase_price']
-            product.purchase_price = (old_value + incoming_value) / new_quantity
-            product.stock_quantity += data['quantity']
+            product.purchase_price = (old_value + incoming_value) / new_quantity if new_quantity else data['unit_purchase_price']
+            product.stock_quantity = new_quantity
             product.save()
             product.sync_shared_stock_to_departments()
             if stock:

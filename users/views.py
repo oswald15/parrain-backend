@@ -8,11 +8,15 @@ from .models import User
 from .serializers import (
     LoginSerializer, UserSerializer,
     UserListSerializer, UserCreateSerializer, UserUpdateSerializer,
-    UserPermissionsSerializer, MANAGEABLE_PERMISSION_CODENAMES,
+    UserPermissionsSerializer, MANAGEABLE_PERMISSION_CODENAMES, PasswordChangeSerializer,
 )
 from .permissions import HasManageUsersRight, HasManageUserPermissionsRight
 from django.utils.decorators import method_decorator
 from django.views.decorators.csrf import csrf_exempt
+from django.utils import timezone
+from django.utils.crypto import get_random_string
+from django.contrib.auth.hashers import make_password
+from datetime import timedelta
 
 # RegisterView (inscription anonyme, AllowAny, organisation choisie librement par le client)
 # a ete retiree : aucun frontend (web/mobile) ne l'appelait, et elle permettait a n'importe
@@ -71,6 +75,41 @@ class LogoutView(APIView):
     def post(self, request):
         request.user.auth_token.delete()
         return Response({"message": "Déconnexion réussie."}, status=status.HTTP_200_OK)
+
+
+class UserPasswordResetView(APIView):
+    permission_classes = [IsAuthenticated, HasManageUsersRight]
+
+    def post(self, request, pk):
+        target = generics.get_object_or_404(
+            User.objects.filter(organisation=request.user.organisation), pk=pk
+        )
+        temporary_password = get_random_string(12)
+        target.password = make_password(temporary_password)
+        target.must_change_password = True
+        target.password_reset_expires_at = timezone.now() + timedelta(minutes=10)
+        target.save(update_fields=['password', 'must_change_password', 'password_reset_expires_at'])
+        return Response({
+            'detail': 'Mot de passe temporaire genere. Il expire dans 10 minutes.',
+            'temporary_password': temporary_password,
+            'expires_at': target.password_reset_expires_at,
+        })
+
+
+class PasswordChangeView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        serializer = PasswordChangeSerializer(data=request.data, context={'request': request})
+        serializer.is_valid(raise_exception=True)
+        user = request.user
+        user.set_password(serializer.validated_data['new_password'])
+        user.must_change_password = False
+        user.password_reset_expires_at = None
+        user.save(update_fields=['password', 'must_change_password', 'password_reset_expires_at'])
+        Token.objects.filter(user=user).delete()
+        token = Token.objects.create(user=user)
+        return Response({'token': token.key, 'user': UserSerializer(user).data})
 
 
 class UserListCreateView(generics.ListCreateAPIView):
