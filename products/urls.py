@@ -1,6 +1,6 @@
 from django.urls import path
 from .views import (
-    ProductListCreateView, ProductRetrieveUpdateDestroyView, ProductBelowThresholdView,
+    ProductListCreateView, ProductRetrieveUpdateDestroyView, ProductPermanentDeleteView, ProductBelowThresholdView,
     StockRequestListCreateView, StockRequestApproveView,
     BudgetRequestListCreateView, BudgetRequestValidateView, BudgetRequestRejectView, MyBudgetView,
     CategoryListCreateView, CategoryRetrieveUpdateDestroyView,
@@ -14,6 +14,7 @@ from .views import (
 urlpatterns = [
     path('products/', ProductListCreateView.as_view(), name='product-list-create'),
     path('products/<uuid:pk>/', ProductRetrieveUpdateDestroyView.as_view(), name='product-detail'),
+    path('products/<uuid:pk>/delete-definitif/', ProductPermanentDeleteView.as_view(), name='product-delete-definitif'),
     path('products/low-stock/', ProductBelowThresholdView.as_view(), name='low-stock'),
     path('stock-requests/', StockRequestListCreateView.as_view(), name='stock-request-list-create'),
     path('stock-requests/<uuid:pk>/approve/', StockRequestApproveView.as_view(), name='stock-request-approve'),

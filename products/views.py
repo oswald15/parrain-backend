@@ -98,6 +98,40 @@ class ProductRetrieveUpdateDestroyView(generics.RetrieveUpdateDestroyAPIView):
         instance.is_active = False
         instance.save()
 
+
+class ProductPermanentDeleteView(APIView):
+    """Suppression DEFINITIVE d'un produit deja archive (is_active=False) - reserve a l'ecran
+    Archives, distinct du DELETE de ProductRetrieveUpdateDestroyView qui ne fait qu'un
+    soft-delete (desactivation). Refuse si le produit a un historique de ventes (OrderItem) pour
+    ne jamais casser une facture/commande passee - seuls les mouvements de stock (Avarie,
+    StockMovement, DepartmentStock...) sont supprimes en cascade, ils n'ont pas de valeur
+    d'archive comparable a une facture client."""
+    permission_classes = [permissions.IsAuthenticated, IsAdminOrSuperAdmin]
+
+    def delete(self, request, pk):
+        from orders.models import OrderItem
+
+        product = get_object_or_404(Product, id=pk, organisation=request.user.organisation)
+
+        if product.is_active:
+            return Response(
+                {'detail': "Desactivez d'abord ce produit avant de le supprimer definitivement."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        if OrderItem.objects.filter(product=product).exists():
+            return Response(
+                {'detail': 'Suppression impossible : ce produit a un historique de ventes.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        if product.image_url:
+            image_path = product.image_url.split(settings.MEDIA_URL)[-1]
+            if default_storage.exists(image_path):
+                default_storage.delete(image_path)
+
+        product.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
 class ProductBelowThresholdView(generics.ListAPIView):
     serializer_class = ProductSerializer
     permission_classes = [permissions.IsAuthenticated]
