@@ -33,8 +33,31 @@ class Product(models.Model):
         return self.stock_quantity < self.min_threshold
 
     def sync_shared_stock_to_departments(self):
+        """Propage le stock organisationnel (stock_quantity) a TOUS les departements de
+        l'organisation, en creant au passage la ligne DepartmentStock manquante pour un
+        departement qui n'en avait pas encore (ex: produit jamais assigne explicitement a ce
+        departement). Sans cette creation, un produit a stock partage n'apparaissait dans
+        l'inventaire/stock d'un departement que s'il y avait deja ete assigne manuellement."""
         if not self.shared_stock:
             return
+        existing_dept_ids = set(
+            DepartmentStock.objects.filter(organisation=self.organisation, product=self)
+            .values_list('department_id', flat=True)
+        )
+        missing_departments = Department.objects.filter(
+            organisation=self.organisation
+        ).exclude(id__in=existing_dept_ids)
+        for department in missing_departments:
+            DepartmentStock.objects.create(
+                organisation=self.organisation,
+                department=department,
+                product=self,
+                family=self.category,
+                quantity=self.stock_quantity,
+                weighted_average_cost=self.purchase_price,
+                sale_price=self.price,
+                min_threshold=self.min_threshold,
+            )
         DepartmentStock.objects.filter(
             organisation=self.organisation,
             product=self,

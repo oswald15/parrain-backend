@@ -54,46 +54,78 @@ def caissier_can_access_tab(user, tab):
 
 
 def _validate_stock_for_closure(order):
-    """Leve ValidationError si le stock departemental est insuffisant pour un item
-    actif de la commande. Lecture seule - ne decremente rien (voir
-    _decrement_stock_for_closure), pour permettre de verifier plusieurs commandes
-    (ex: un ClientTab multi-departements) avant de decrementer quoi que ce soit."""
-    for item in order.items.filter(is_removed=False):
-        stock = DepartmentStock.objects.filter(
-            department=order.department, product=item.product
-        ).first()
-        available = stock.quantity if stock else 0
-        if available < item.quantity:
-            raise ValidationError({
-                'detail': f"Stock insuffisant pour {item.product.name} "
-                          f"({available} disponible, {item.quantity} demande)."
-            })
+    """Ne bloque plus la vente en cas de stock insuffisant : le caissier/la serveuse
+    peut encaisser meme a stock nul ou insuffisant, quitte a faire passer le stock
+    departemental en negatif - un approvisionnement ulterieur vient alors le
+    resorber. Conservee (no-op) pour ne pas casser les appels existants."""
+    return
+
+
+def _apply_stock_delta(department, product, delta):
+    """Applique delta (negatif pour une vente/sortie, positif pour un recredit
+    d'annulation) au stock d'un produit, en gerant les deux modes possibles :
+    - shared_stock=True : stock unique au niveau de l'organisation (approvisionne
+      globalement, commun a tous les departements) -> on modifie Product.stock_quantity
+      puis on propage cette meme valeur a tous les DepartmentStock du produit.
+    - shared_stock=False : stock reparti par departement -> on modifie uniquement le
+      DepartmentStock du departement de la commande, puis Product.stock_quantity (stock
+      total de l'organisation) est recalcule comme la somme de tous les DepartmentStock.
+    Verrouille (select_for_update) les lignes touchees pour rester coherent sous
+    encaissements concurrents ; le stock peut devenir negatif (aucune limite basse)."""
+    product = Product.objects.select_for_update().get(pk=product.pk)
+    if product.shared_stock:
+        product.stock_quantity = models.F('stock_quantity') + delta
+        product.save(update_fields=['stock_quantity'])
+        product.refresh_from_db(fields=['stock_quantity'])
+        product.sync_shared_stock_to_departments()
+    else:
+        stock, _created = DepartmentStock.objects.select_for_update().get_or_create(
+            department=department, product=product, defaults={'quantity': 0}
+        )
+        stock.quantity = models.F('quantity') + delta
+        stock.save(update_fields=['quantity'])
+        total = DepartmentStock.objects.filter(product=product).aggregate(
+            total=models.Sum('quantity')
+        )['total'] or 0
+        product.stock_quantity = total
+        product.save(update_fields=['stock_quantity'])
 
 
 def _decrement_stock_for_closure(order):
     for item in order.items.filter(is_removed=False):
-        stock = DepartmentStock.objects.get(department=order.department, product=item.product)
-        stock.quantity -= item.quantity
-        stock.save()
+        _apply_stock_delta(order.department, item.product, -item.quantity)
 
 
 def _create_sortie_vente_transaction(order, author):
-    Transaction.objects.get_or_create(
-        organisation=order.organisation,
-        order=order,
-        transaction_type='sortie_vente',
-        defaults={
-            'department': order.department,
-            'number': str(order.id),
-            'payment_type': order.payment_type,
-            'quantity': sum(item.quantity for item in order.items.filter(is_removed=False)),
-            'amount': order.total_amount,
-            'waitress_code': order.serveur.phone if order.serveur else '',
-            'serveur': order.serveur,
-            'client': order.client_name,
-            'author': author,
-        }
-    )
+    """Une ligne de Transaction 'sortie_vente' PAR PRODUIT (et non une seule ligne
+    agregee par commande), product et department renseignes, pour que les stats de
+    rentabilite/quantite vendue par departement (DepartmentProfitabilityReportView,
+    InventoryDepartmentProfitabilityView) puissent grouper par (department, product)."""
+    quantity_by_product = {}
+    amount_by_product = {}
+    for item in order.items.filter(is_removed=False):
+        quantity_by_product[item.product_id] = quantity_by_product.get(item.product_id, 0) + item.quantity
+        amount_by_product[item.product_id] = amount_by_product.get(item.product_id, Decimal('0')) \
+            + (item.quantity * item.unit_price)
+
+    for product_id, quantity in quantity_by_product.items():
+        Transaction.objects.get_or_create(
+            organisation=order.organisation,
+            order=order,
+            transaction_type='sortie_vente',
+            product_id=product_id,
+            defaults={
+                'department': order.department,
+                'number': str(order.id),
+                'payment_type': order.payment_type,
+                'quantity': quantity,
+                'amount': amount_by_product[product_id],
+                'waitress_code': order.serveur.phone if order.serveur else '',
+                'serveur': order.serveur,
+                'client': order.client_name,
+                'author': author,
+            }
+        )
 
 
 class OrdersOpenedTodayView(generics.ListAPIView):
@@ -252,10 +284,7 @@ class OrderItemDeleteView(APIView):
 
         # Si le stock avait deja ete decompte (commande encaissee), on le recredite.
         if order.status == 'fermee':
-            stock = DepartmentStock.objects.filter(department=order.department, product=removed_product).first()
-            if stock:
-                stock.quantity += removed_quantity
-                stock.save()
+            _apply_stock_delta(order.department, removed_product, removed_quantity)
 
         order.total_amount = sum(i.quantity * i.unit_price for i in order.items.filter(is_removed=False))
         order.save()
@@ -289,10 +318,7 @@ class OrderCancelView(APIView):
         # Si la commande etait deja encaissee, le stock decompte a la cloture est integralement recredite.
         if order.status == 'fermee':
             for item in order.items.filter(is_removed=False):
-                stock = DepartmentStock.objects.filter(department=order.department, product=item.product).first()
-                if stock:
-                    stock.quantity += item.quantity
-                    stock.save()
+                _apply_stock_delta(order.department, item.product, item.quantity)
 
         order.status = 'annulee'
         order.cancelled_at = timezone.now()
@@ -1086,9 +1112,10 @@ class ClientTabInvoicePdfView(APIView):
 
 class ClientTabCloseView(APIView):
     """Encaissement cote caissier : cloture atomiquement toutes les Order de
-    l'onglet (une par departement). Le stock de TOUS les departements est
-    verifie avant la moindre decrementation, pour qu'une penurie sur un seul
-    departement bloque l'encaissement entier plutot que de le faire a moitie."""
+    l'onglet (une par departement). La vente n'est plus bloquee par une
+    penurie de stock (voir _validate_stock_for_closure, desormais no-op) :
+    le stock departemental peut devenir negatif, a resorber par un
+    approvisionnement ulterieur."""
     permission_classes = [permissions.IsAuthenticated, IsCaissierOrAdmin]
 
     @transaction.atomic
