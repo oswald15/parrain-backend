@@ -97,16 +97,27 @@ class BusinessDay(models.Model):
 
 
 class CashierDayBalance(models.Model):
-    """Solde de caisse d'un caissier pour une BusinessDay donnee. opening_amount est fixe par
-    l'admin a l'ouverture ; closing_amount est calcule automatiquement a la fermeture
-    (opening_amount + ventes encaissees - sorties de caisse de CE caissier depuis l'ouverture
-    de la session) - voir BusinessDayCloseView. Permet a l'admin de consulter l'historique
-    caisse par caisse, jour par jour (BusinessDayHistoryView)."""
+    """Une SESSION de caisse d'un caissier au sein d'une BusinessDay. opening_amount est fixe
+    par l'admin a l'ouverture de la journee et reste IDENTIQUE pour toutes les sessions du
+    caissier ce jour-la (chaque reouverture reprend le meme fond de caisse alloue au depart -
+    voir CashierSessionOpenView) ; closing_amount est calcule automatiquement a la fermeture de
+    la session (opening_amount + ventes encaissees - sorties de caisse de CE caissier depuis
+    l'ouverture de CETTE session, voir CashierSessionCloseView) plutot qu'a la fermeture de la
+    journee entiere, pour permettre a plusieurs caissiers de se relayer sur la meme journee en
+    remettant chacun leur compteur a zero. Plusieurs sessions par (business_day, cashier) sont
+    donc possibles (pas de unique_together) : la premiere est creee automatiquement par
+    BusinessDayOpenView (deja "ouverte", closing_amount nul), les suivantes par
+    CashierSessionOpenView apres qu'une session precedente a ete fermee. A la fermeture de la
+    journee (BusinessDayCloseView), toute session encore ouverte est cloturee d'office - le
+    comportement redevient alors identique a avant (plus aucune session ouverte, tout est a
+    zero jusqu'a la prochaine ouverture de journee)."""
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     business_day = models.ForeignKey(BusinessDay, on_delete=models.CASCADE, related_name='cashier_balances')
     cashier = models.ForeignKey('users.User', on_delete=models.CASCADE, related_name='day_balances')
     opening_amount = models.DecimalField(max_digits=12, decimal_places=2, default=0)
     closing_amount = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    opened_at = models.DateTimeField(default=timezone.now)
+    closed_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
-        unique_together = ('business_day', 'cashier')
+        ordering = ['opened_at']

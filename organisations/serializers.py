@@ -32,7 +32,7 @@ class CashierDayBalanceSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = CashierDayBalance
-        fields = ['id', 'cashier', 'cashier_name', 'opening_amount', 'closing_amount']
+        fields = ['id', 'cashier', 'cashier_name', 'opening_amount', 'closing_amount', 'opened_at', 'closed_at']
         read_only_fields = fields
 
 

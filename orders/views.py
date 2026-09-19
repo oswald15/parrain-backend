@@ -9,7 +9,7 @@ from rest_framework.authtoken.models import Token
 from rest_framework.exceptions import ValidationError, PermissionDenied
 from orders.models import Order, OrderItem, CashExpense, Transaction, Consignment, ClientTab, Bon, BonItem
 from products.models import DepartmentStock, Product
-from organisations.models import Department, BusinessDay
+from organisations.models import Department, BusinessDay, CashierDayBalance
 from .serializers import (
     OrderSerializer, OrderItemSerializer, CashExpenseSerializer, TransactionSerializer,
     ConsignmentSerializer, ClientTabSerializer, BonSerializer, BonItemSerializer,
@@ -94,6 +94,26 @@ def _apply_stock_delta(department, product, delta):
 def _decrement_stock_for_closure(order):
     for item in order.items.filter(is_removed=False):
         _apply_stock_delta(order.department, item.product, -item.quantity)
+
+
+def _require_open_cashier_session(user):
+    """Un caissier sans session de caisse ouverte (voir organisations/models.py::
+    CashierDayBalance) ne peut pas encaisser : sans ce garde-fou, la vente ne serait rattachee
+    a aucune session et disparaitrait silencieusement du calcul de solde (CaissierDailySummaryView
+    / CashierSessionCloseView ne regardent que la session ouverte). Ne concerne que le role
+    caissier - un admin qui encaisse directement n'a pas de session de caisse a ouvrir."""
+    if user.role != 'caissier':
+        return
+    has_open_session = CashierDayBalance.objects.filter(
+        business_day__organisation=user.organisation,
+        business_day__is_open=True,
+        cashier=user,
+        closing_amount__isnull=True,
+    ).exists()
+    if not has_open_session:
+        raise ValidationError({
+            'detail': "Vous n'avez pas de session de caisse ouverte. Ouvrez votre caisse avant d'encaisser."
+        })
 
 
 def _create_sortie_vente_transaction(order, author):
@@ -252,6 +272,7 @@ class OrderStatusUpdateView(generics.UpdateAPIView):
         becoming_fermee = serializer.validated_data.get('status') == 'fermee' and not was_already_fermee
 
         if becoming_fermee:
+            _require_open_cashier_session(self.request.user)
             _validate_stock_for_closure(serializer.instance)
 
         order = serializer.save()
@@ -532,10 +553,11 @@ class GlobalCashPositionView(APIView):
         })
 
 class CaissierDailySummaryView(APIView):
-    """Resume de caisse du caissier connecte, scope sur la SESSION en cours (depuis
-    l'ouverture de la journee par l'admin) plutot que sur la date calendaire - des la
-    fermeture de la journee, tout revient a 0 (plus de session en cours), et repart de zero
-    a la prochaine ouverture (voir organisations/models.py::BusinessDay)."""
+    """Resume de caisse du caissier connecte, scope sur SA SESSION de caisse en cours (voir
+    organisations/models.py::CashierDayBalance) plutot que sur la journee entiere ou la date
+    calendaire - permet a plusieurs caissiers de se relayer sur la meme journee : des que le
+    caissier ferme sa session (CashierSessionCloseView), tout revient a 0 pour lui jusqu'a ce
+    qu'il (ou un collegue) en ouvre une nouvelle (CashierSessionOpenView)."""
     permission_classes = [permissions.IsAuthenticated, IsCaissier]
 
     def get(self, request):
@@ -543,29 +565,35 @@ class CaissierDailySummaryView(APIView):
             organisation=request.user.organisation, is_open=True
         ).first()
 
-        if not current_day:
-            return Response({
-                'date': datetime.now().date(),
-                'total_revenue': 0,
-                'total_closed_orders': 0,
-                'cash_payments': 0,
-                'mobile_money_payments': 0,
-                'total_expenses': 0,
-                'opening_amount': 0,
-                'net_cash': 0,
-                'by_department': [],
-            })
+        empty_response = {
+            'date': datetime.now().date(),
+            'total_revenue': 0,
+            'total_closed_orders': 0,
+            'cash_payments': 0,
+            'mobile_money_payments': 0,
+            'total_expenses': 0,
+            'opening_amount': 0,
+            'net_cash': 0,
+            'by_department': [],
+            'session_open': False,
+        }
 
-        balance = current_day.cashier_balances.filter(cashier=request.user).first()
-        opening_amount = balance.opening_amount if balance else 0
+        if not current_day:
+            return Response(empty_response)
+
+        session = current_day.cashier_balances.filter(cashier=request.user, closing_amount__isnull=True).first()
+        if not session:
+            return Response(empty_response)
+
+        opening_amount = session.opening_amount
 
         orders = Order.objects.filter(
             cashier=request.user,
-            closed_at__gte=current_day.opened_at,
+            closed_at__gte=session.opened_at,
             status='fermee'
         )
         expenses = CashExpense.objects.filter(
-            cashier=request.user, created_at__gte=current_day.opened_at, is_deleted=False
+            cashier=request.user, created_at__gte=session.opened_at, is_deleted=False
         )
 
         total_revenue = orders.aggregate(Sum('total_amount'))['total_amount__sum'] or 0
@@ -597,6 +625,7 @@ class CaissierDailySummaryView(APIView):
                 }
                 for row in by_department
             ],
+            'session_open': True,
         })
 
 class CashExpenseListCreateView(generics.ListCreateAPIView):
@@ -1133,6 +1162,11 @@ class ClientTabCloseView(APIView):
                 {'detail': "Cet onglet n'est pas pret pour encaissement."},
                 status=status.HTTP_400_BAD_REQUEST
             )
+
+        try:
+            _require_open_cashier_session(request.user)
+        except ValidationError as exc:
+            return Response(exc.detail, status=status.HTTP_400_BAD_REQUEST)
 
         orders = list(tab.orders.filter(status='servie'))
         if not orders:

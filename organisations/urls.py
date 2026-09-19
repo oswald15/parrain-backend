@@ -4,6 +4,7 @@ from .views import (
     LicenceEtatView, OrganisationAbonnementView, OrganisationActiverCodeView,
     DepartmentListCreateView, DepartmentDetailView,
     BusinessDayCurrentView, BusinessDayOpenView, BusinessDayCloseView, BusinessDayHistoryView,
+    CashierSessionOpenView, CashierSessionCloseView,
 )
 
 urlpatterns = [
@@ -18,4 +19,6 @@ urlpatterns = [
     path('business-day/open/', BusinessDayOpenView.as_view(), name='business-day-open'),
     path('business-day/close/', BusinessDayCloseView.as_view(), name='business-day-close'),
     path('business-day/history/', BusinessDayHistoryView.as_view(), name='business-day-history'),
+    path('business-day/session/open/', CashierSessionOpenView.as_view(), name='cashier-session-open'),
+    path('business-day/session/close/', CashierSessionCloseView.as_view(), name='cashier-session-close'),
 ]
