@@ -33,31 +33,14 @@ class Product(models.Model):
         return self.stock_quantity < self.min_threshold
 
     def sync_shared_stock_to_departments(self):
-        """Propage le stock organisationnel (stock_quantity) a TOUS les departements de
-        l'organisation, en creant au passage la ligne DepartmentStock manquante pour un
-        departement qui n'en avait pas encore (ex: produit jamais assigne explicitement a ce
-        departement). Sans cette creation, un produit a stock partage n'apparaissait dans
-        l'inventaire/stock d'un departement que s'il y avait deja ete assigne manuellement."""
+        """Propage le stock organisationnel (stock_quantity) aux departements ou ce produit a
+        DEJA ete envoye (une ligne DepartmentStock existe, creee par DepartmentStockAssignView
+        au moment ou un prix de vente lui est attribue pour ce departement). Ne cree jamais de
+        nouvelle ligne ici : un produit a stock partage n'est visible dans un departement que
+        si on le lui a explicitement assigne, il n'est pas reparti d'office a TOUS les
+        departements a sa creation."""
         if not self.shared_stock:
             return
-        existing_dept_ids = set(
-            DepartmentStock.objects.filter(organisation=self.organisation, product=self)
-            .values_list('department_id', flat=True)
-        )
-        missing_departments = Department.objects.filter(
-            organisation=self.organisation
-        ).exclude(id__in=existing_dept_ids)
-        for department in missing_departments:
-            DepartmentStock.objects.create(
-                organisation=self.organisation,
-                department=department,
-                product=self,
-                family=self.category,
-                quantity=self.stock_quantity,
-                weighted_average_cost=self.purchase_price,
-                sale_price=self.price,
-                min_threshold=self.min_threshold,
-            )
         DepartmentStock.objects.filter(
             organisation=self.organisation,
             product=self,
@@ -280,10 +263,33 @@ class InventoryLine(models.Model):
     sale_price = models.DecimalField(max_digits=10, decimal_places=2, default=0)
 
     @property
+    def current_system_quantity(self):
+        """Stock systeme EN TEMPS REEL pour ce produit/departement, relu a chaque acces plutot
+        que fige sur la valeur enregistree a la creation de l'inventaire - sans ca, les ventes
+        survenues pendant qu'un inventaire est en attente de saisie/validation ne se
+        reperctutaient jamais sur l'ecart affiche (difference)."""
+        if self.department_id:
+            stock = DepartmentStock.objects.filter(
+                department_id=self.department_id, product_id=self.product_id
+            ).first()
+            return stock.quantity if stock else 0
+        return self.product.stock_quantity
+
+    @property
+    def effective_system_quantity(self):
+        """Live tant que l'inventaire n'est pas valide ; fige (system_quantity enregistre en
+        base) une fois valide, pour que l'ecart/la valorisation restent stables dans l'historique
+        meme apres des mouvements de stock ulterieurs (voir InventoryValidateView, qui ecrit la
+        valeur live dans system_quantity juste avant d'ecraser le stock avec le compte physique)."""
+        if self.inventory.status == 'valide':
+            return self.system_quantity
+        return self.current_system_quantity
+
+    @property
     def difference(self):
         if self.physical_quantity is None:
             return None
-        return self.physical_quantity - self.system_quantity
+        return self.physical_quantity - self.effective_system_quantity
 
     @property
     def unit_price(self):

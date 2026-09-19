@@ -183,7 +183,7 @@ class BusinessDayCloseView(APIView):
 
     @transaction.atomic
     def post(self, request):
-        from orders.models import Order, CashExpense
+        from orders.models import Order, CashExpense, Transaction
 
         current = BusinessDay.objects.filter(
             organisation=request.user.organisation, is_open=True
@@ -206,6 +206,14 @@ class BusinessDayCloseView(APIView):
             balance.closing_amount = balance.opening_amount + revenue - expenses
             balance.closed_at = timezone.now()
             balance.save()
+            Transaction.objects.create(
+                organisation=request.user.organisation,
+                transaction_type='fermeture_session',
+                number=str(balance.id),
+                amount=balance.closing_amount,
+                serveur=balance.cashier,
+                author=request.user,
+            )
 
         current.is_open = False
         current.closed_at = timezone.now()
@@ -225,6 +233,8 @@ class CashierSessionOpenView(APIView):
 
     @transaction.atomic
     def post(self, request):
+        from orders.models import Transaction
+
         day = BusinessDay.objects.filter(
             organisation=request.user.organisation, is_open=True
         ).first()
@@ -249,6 +259,14 @@ class CashierSessionOpenView(APIView):
             opening_amount=reference_balance.opening_amount,
             opened_at=timezone.now(),
         )
+        Transaction.objects.create(
+            organisation=request.user.organisation,
+            transaction_type='ouverture_session',
+            number=str(session.id),
+            amount=session.opening_amount,
+            serveur=request.user,
+            author=request.user,
+        )
         return Response(CashierDayBalanceSerializer(session).data, status=status.HTTP_201_CREATED)
 
 
@@ -261,7 +279,7 @@ class CashierSessionCloseView(APIView):
 
     @transaction.atomic
     def post(self, request):
-        from orders.models import Order, CashExpense
+        from orders.models import Order, CashExpense, Transaction
 
         day = BusinessDay.objects.filter(
             organisation=request.user.organisation, is_open=True
@@ -284,6 +302,14 @@ class CashierSessionCloseView(APIView):
         session.closing_amount = session.opening_amount + revenue - expenses
         session.closed_at = timezone.now()
         session.save()
+        Transaction.objects.create(
+            organisation=request.user.organisation,
+            transaction_type='fermeture_session',
+            number=str(session.id),
+            amount=session.closing_amount,
+            serveur=request.user,
+            author=request.user,
+        )
         return Response(CashierDayBalanceSerializer(session).data)
 
 

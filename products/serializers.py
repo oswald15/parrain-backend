@@ -114,6 +114,7 @@ class InventoryLineSerializer(serializers.ModelSerializer):
     family_name = serializers.ReadOnlyField(source='product.category.name')
     image = serializers.ReadOnlyField(source='product.image_url')
     department_name = serializers.ReadOnlyField(source='department.name')
+    system_quantity = serializers.ReadOnlyField(source='effective_system_quantity')
     difference = serializers.ReadOnlyField()
     unit_price = serializers.ReadOnlyField()
     valuation = serializers.ReadOnlyField()

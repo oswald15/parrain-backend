@@ -113,6 +113,8 @@ class Transaction(models.Model):
         ('avaries', 'Avaries'),
         ('octroi_budget', 'Octroi de budget approvisionneur'),
         ('fond_caisse', 'Fond de caisse (ouverture de journee)'),
+        ('ouverture_session', 'Ouverture de session de caisse'),
+        ('fermeture_session', 'Fermeture de session de caisse'),
     ]
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)

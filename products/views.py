@@ -630,6 +630,13 @@ class InventoryValidateView(APIView):
             return Response({'detail': 'Toutes les quantites physiques doivent etre saisies.'}, status=status.HTTP_400_BAD_REQUEST)
         touched_products = set()
         for line in lines:
+            # Fige system_quantity sur le stock REEL juste avant de l'ecraser par le compte
+            # physique - le stock a pu bouger (ventes) depuis la creation de l'inventaire, la
+            # valeur figee a la creation serait perimee. Une fois valide, l'ecart/la valorisation
+            # se basent sur cette valeur figee (voir InventoryLine.effective_system_quantity),
+            # pour rester stables dans l'historique malgre les mouvements de stock ulterieurs.
+            line.system_quantity = line.current_system_quantity
+            line.save(update_fields=['system_quantity'])
             if line.department_id is None:
                 line.product.stock_quantity = line.physical_quantity
                 line.product.save(update_fields=['stock_quantity'])
