@@ -1,5 +1,23 @@
 from rest_framework import serializers
+from rest_framework.validators import UniqueValidator
 from .models import Order, OrderItem, CashExpense, Transaction, Consignment, ClientTab, Bon, BonItem
+
+
+def client_generated_id(model):
+    """Autorise le client a fournir lui-meme l'UUID de l'objet qu'il cree.
+
+    Indispensable au mode hors-ligne : la serveuse ouvre un onglet sans reseau puis y ajoute
+    aussitot des articles. Si l'identifiant n'etait attribue qu'au moment de la synchronisation,
+    l'app devrait manipuler un identifiant provisoire puis le remplacer partout apres coup.
+
+    DRF met les cles primaires en lecture seule par defaut, d'ou cette redeclaration explicite -
+    et avec elle, le `UniqueValidator` qu'il n'ajoute alors plus automatiquement. Sans ce
+    validateur, un UUID deja pris renverrait une erreur d'integrite brute au lieu d'un refus
+    clair."""
+    return serializers.UUIDField(
+        required=False,
+        validators=[UniqueValidator(queryset=model.objects.all())],
+    )
 
 
 class OrderItemSerializer(serializers.ModelSerializer):
@@ -18,6 +36,7 @@ class OrderItemSerializer(serializers.ModelSerializer):
 
 
 class OrderSerializer(serializers.ModelSerializer):
+    id = client_generated_id(Order)
     items = OrderItemSerializer(many=True)
     serveur_name = serializers.ReadOnlyField(source='serveur.name')
     cashier_name = serializers.ReadOnlyField(source='cashier.name')
@@ -171,6 +190,7 @@ class BonSerializer(serializers.ModelSerializer):
 
 
 class ClientTabSerializer(serializers.ModelSerializer):
+    id = client_generated_id(ClientTab)
     serveur_name = serializers.ReadOnlyField(source='serveur.name')
     orders = OrderSerializer(many=True, read_only=True)
     bons = BonSerializer(many=True, read_only=True)

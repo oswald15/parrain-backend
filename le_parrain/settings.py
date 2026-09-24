@@ -75,6 +75,7 @@ INSTALLED_APPS = [
     'orders',
     'vouchers',
     'console',
+    'sync',
 ]
 
 MIDDLEWARE = [
@@ -88,6 +89,14 @@ MIDDLEWARE = [
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
     'console.middleware.LicenceGateMiddleware',
     'organisations.middleware.BusinessDayGateMiddleware',
+    # En dernier, donc au plus pres des vues : une requete refusee par les gardes ci-dessus
+    # n'arrive jamais jusqu'ici et n'a pas a etre remontee. Sans effet sur le serveur central
+    # (voir sync/upstream.py).
+    'sync.upstream.UpstreamCaptureMiddleware',
+    # Symetrique du precedent, et sans effet sur une instance locale : capture les corrections
+    # que l'admin fait a distance, pour qu'elles redescendent vers le bar (voir
+    # sync/downstream.py).
+    'sync.downstream.DownstreamCaptureMiddleware',
 ]
 
 AUTH_USER_MODEL = 'users.User'
@@ -157,11 +166,40 @@ AUTH_PASSWORD_VALIDATORS = [
 REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': (
         'rest_framework.authentication.TokenAuthentication',
+        # Remontee des operations depuis une instance installee dans un bar. Placee apres
+        # l'authentification par jeton : elle ne s'active que sur un entete 'Instance', et
+        # laisse passer tout le reste (voir sync/authentication.py).
+        'sync.authentication.SyncInstanceAuthentication',
     ),
     'DEFAULT_PERMISSION_CLASSES': (
         'rest_framework.permissions.IsAuthenticated',
     ),
+    # Ajoute un code machine a chaque erreur, pour que la file d'attente hors-ligne puisse
+    # decider seule entre reessayer, abandonner ou alerter (voir sync/exceptions.py).
+    'EXCEPTION_HANDLER': 'sync.exceptions.exception_handler',
 }
+
+# Role de cette instance : 'cloud' (serveur central, admin et approvisionneur) ou 'local'
+# (instance installee sur le poste du caissier, dans le bar).
+#
+# Le bar doit pouvoir travailler sans internet : une instance locale autorise donc des actions
+# que le cloud reserve a l'admin - ouvrir la journee, par exemple, sans quoi une coupure le matin
+# empecherait le bar d'ouvrir. A l'inverse, le cloud refuse certaines actions sur des donnees
+# qu'un bar hors-ligne est peut-etre en train de modifier, faute de quoi les deux versions
+# divergeraient sans moyen de les reconcilier.
+INSTANCE_ROLE = config('INSTANCE_ROLE', default='cloud')
+IS_LOCAL_INSTANCE = INSTANCE_ROLE == 'local'
+
+# Coordonnees du serveur central, utilisees par une instance locale pour y remonter ses
+# operations (voir sync/management/commands/push_upstream.py). Sans objet sur le cloud.
+CLOUD_API_URL = config('CLOUD_API_URL', default='')
+INSTANCE_TOKEN = config('INSTANCE_TOKEN', default='')
+
+# Adresse a laquelle l'instance se joint elle-meme pour appliquer les corrections descendues du
+# serveur central (voir sync/management/commands/pull_operations.py). Elle repasse par sa propre
+# API plutot que d'ecrire en base : une annulation doit rejouer la meme logique metier - stock
+# rendu, ecritures au journal, session de caisse - que si le caissier l'avait faite sur place.
+LOCAL_API_URL = config('LOCAL_API_URL', default='http://127.0.0.1:8000')
 
 # Signature des codes d'activation (console systeme) - voir console/management/commands/generer_cle_editeur.py.
 # Cle privee : secret, uniquement dans .env, lue par console/services/licence.py (emission).

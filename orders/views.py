@@ -9,7 +9,12 @@ from rest_framework.authtoken.models import Token
 from rest_framework.exceptions import ValidationError, PermissionDenied
 from orders.models import Order, OrderItem, CashExpense, Transaction, Consignment, ClientTab, Bon, BonItem
 from products.models import DepartmentStock, Product
-from organisations.models import Department, BusinessDay, CashierDayBalance
+from organisations.models import Department, BusinessDay
+from sync.mixins import IdempotencyMixin
+from sync.context import client_created_at
+from sync.guards import describe_blocking_bars
+from sync.models import SyncInstance
+from orders import cash_sessions
 from .serializers import (
     OrderSerializer, OrderItemSerializer, CashExpenseSerializer, TransactionSerializer,
     ConsignmentSerializer, ClientTabSerializer, BonSerializer, BonItemSerializer,
@@ -96,24 +101,58 @@ def _decrement_stock_for_closure(order):
         _apply_stock_delta(order.department, item.product, -item.quantity)
 
 
-def _require_open_cashier_session(user):
-    """Un caissier sans session de caisse ouverte (voir organisations/models.py::
-    CashierDayBalance) ne peut pas encaisser : sans ce garde-fou, la vente ne serait rattachee
-    a aucune session et disparaitrait silencieusement du calcul de solde (CaissierDailySummaryView
-    / CashierSessionCloseView ne regardent que la session ouverte). Ne concerne que le role
-    caissier - un admin qui encaisse directement n'a pas de session de caisse a ouvrir."""
+def _require_open_cashier_session(user, request=None):
+    """Un caissier sans session de caisse ne peut pas encaisser : sans ce garde-fou, la vente ne
+    serait rattachee a aucune session et disparaitrait du calcul de solde. Ne concerne que le
+    role caissier - un admin qui encaisse directement n'a pas de session de caisse a ouvrir.
+
+    Une action venue de la file hors-ligne fait exception des lors qu'elle designe une session
+    valide (entete `X-Cashier-Session`), meme fermee depuis : elle a ete faite alors que la
+    caisse etait bien ouverte, et la refuser ferait perdre une vente reellement encaissee."""
     if user.role != 'caissier':
         return
-    has_open_session = CashierDayBalance.objects.filter(
-        business_day__organisation=user.organisation,
-        business_day__is_open=True,
-        cashier=user,
-        closing_amount__isnull=True,
-    ).exists()
-    if not has_open_session:
-        raise ValidationError({
-            'detail': "Vous n'avez pas de session de caisse ouverte. Ouvrez votre caisse avant d'encaisser."
-        })
+    if request is not None and cash_sessions.resolve_session(user, request) is not None:
+        return
+    raise ValidationError({
+        'detail': "Vous n'avez pas de session de caisse ouverte. Ouvrez votre caisse avant d'encaisser."
+    })
+
+
+def _refuse_if_bar_not_synced(request):
+    """Refuse une correction a distance tant qu'un bar n'a pas remonte tout son travail.
+
+    Ces actions (annuler une vente, retirer une ligne, encaisser) recreditent le stock et
+    reecrivent des montants. Faites depuis le serveur central pendant qu'un bar encaisse
+    hors-ligne, elles divergent de ce que le bar enregistre de son cote, sans moyen de
+    reconcilier ensuite les deux versions.
+
+    Renvoie None quand rien ne bloque - notamment pour un etablissement entierement dans le
+    cloud, qui n'a aucune instance locale, et sur l'instance du bar elle-meme.
+    """
+    # Exemption INDISPENSABLE : la remontee du bar passe par ces memes endpoints. Sans elle, une
+    # instance qui rejoue ses operations declare forcement qu'il lui en reste - ce qui
+    # declencherait le garde-fou contre elle, enverrait la vente en quarantaine, et ferait
+    # perdre exactement ce que ce mecanisme est cense proteger.
+    if isinstance(request.auth, SyncInstance):
+        return None
+
+    blocking = describe_blocking_bars(request.user.organisation)
+    if not blocking:
+        return None
+    return Response(
+        {'detail': blocking, 'code': 'bar_not_synced'},
+        status=status.HTTP_409_CONFLICT,
+    )
+
+
+def _stamp_offline_context(instance, request):
+    """Marque un objet avec le contexte de l'action : horodatage reel cote appareil et session
+    de caisse d'origine. Sans ca, une vente synchronisee apres coup serait rattachee a la
+    fenetre temporelle du rejeu - donc a la mauvaise caisse, voire a aucune."""
+    instance.client_created_at = client_created_at(request) or instance.client_created_at
+    session = cash_sessions.resolve_session(request.user, request)
+    if session is not None:
+        instance.cashier_session = session
 
 
 def _create_sortie_vente_transaction(order, author):
@@ -240,7 +279,7 @@ class AdminOrderListView(generics.ListAPIView):
             queryset = queryset.filter(client_name__icontains=client)
         return queryset.order_by('-created_at')
 
-class OrderStatusUpdateView(generics.UpdateAPIView):
+class OrderStatusUpdateView(IdempotencyMixin, generics.UpdateAPIView):
     queryset = Order.objects.all()
     serializer_class = OrderSerializer
     permission_classes = [permissions.IsAuthenticated]
@@ -272,7 +311,7 @@ class OrderStatusUpdateView(generics.UpdateAPIView):
         becoming_fermee = serializer.validated_data.get('status') == 'fermee' and not was_already_fermee
 
         if becoming_fermee:
-            _require_open_cashier_session(self.request.user)
+            _require_open_cashier_session(self.request.user, self.request)
             _validate_stock_for_closure(serializer.instance)
 
         order = serializer.save()
@@ -282,14 +321,20 @@ class OrderStatusUpdateView(generics.UpdateAPIView):
 
         if order.status == 'fermee':
             order.cashier = self.request.user
+            _stamp_offline_context(order, self.request)
             order.save()
             _create_sortie_vente_transaction(order, self.request.user)
+            cash_sessions.attach_and_refresh(order.cashier_session)
 
 class OrderItemDeleteView(APIView):
     permission_classes = [permissions.IsAuthenticated, IsAdminOnly]
 
     @transaction.atomic
     def delete(self, request, order_id, item_id):
+        refusal = _refuse_if_bar_not_synced(request)
+        if refusal:
+            return refusal
+
         order = get_object_or_404(Order, id=order_id, organisation=request.user.organisation)
         item = get_object_or_404(OrderItem, id=item_id, order=order, is_removed=False)
 
@@ -332,6 +377,10 @@ class OrderCancelView(APIView):
 
     @transaction.atomic
     def post(self, request, order_id):
+        refusal = _refuse_if_bar_not_synced(request)
+        if refusal:
+            return refusal
+
         order = get_object_or_404(Order, id=order_id, organisation=request.user.organisation)
         if order.status == 'annulee':
             return Response({'detail': 'Commande deja annulee.'}, status=status.HTTP_400_BAD_REQUEST)
@@ -363,7 +412,7 @@ class OrderCancelView(APIView):
 
         return Response(OrderSerializer(order).data)
 
-class OrderValidateView(generics.UpdateAPIView):
+class OrderValidateView(IdempotencyMixin, generics.UpdateAPIView):
     serializer_class = OrderSerializer
     permission_classes = [permissions.IsAuthenticated, IsCaissier]
 
@@ -576,6 +625,10 @@ class CaissierDailySummaryView(APIView):
             'net_cash': 0,
             'by_department': [],
             'session_open': False,
+            # Identifiant de la session en cours, que l'app rattache a chaque action faite
+            # hors-ligne (entete X-Cashier-Session). Sans lui, un caissier qui recharge sa page
+            # ne pourrait plus imputer a sa caisse une vente synchronisee plus tard.
+            'session_id': None,
         }
 
         if not current_day:
@@ -587,14 +640,11 @@ class CaissierDailySummaryView(APIView):
 
         opening_amount = session.opening_amount
 
-        orders = Order.objects.filter(
-            cashier=request.user,
-            closed_at__gte=session.opened_at,
-            status='fermee'
-        )
-        expenses = CashExpense.objects.filter(
-            cashier=request.user, created_at__gte=session.opened_at, is_deleted=False
-        )
+        # Rattachement explicite plutot que fenetre temporelle : une vente encaissee hors-ligne
+        # puis synchronisee porte un horodatage serveur tardif, mais appartient bien a cette
+        # session (voir orders/cash_sessions.py).
+        orders = cash_sessions.session_orders(session)
+        expenses = cash_sessions.session_expenses(session)
 
         total_revenue = orders.aggregate(Sum('total_amount'))['total_amount__sum'] or 0
         total_expenses = expenses.aggregate(Sum('amount'))['amount__sum'] or 0
@@ -626,9 +676,10 @@ class CaissierDailySummaryView(APIView):
                 for row in by_department
             ],
             'session_open': True,
+            'session_id': str(session.id),
         })
 
-class CashExpenseListCreateView(generics.ListCreateAPIView):
+class CashExpenseListCreateView(IdempotencyMixin, generics.ListCreateAPIView):
     serializer_class = CashExpenseSerializer
     permission_classes = [permissions.IsAuthenticated, IsCaissier]
 
@@ -643,6 +694,9 @@ class CashExpenseListCreateView(generics.ListCreateAPIView):
             organisation=self.request.user.organisation,
             cashier=self.request.user
         )
+        _stamp_offline_context(expense, self.request)
+        expense.save(update_fields=['client_created_at', 'cashier_session'])
+        cash_sessions.attach_and_refresh(expense.cashier_session)
         Transaction.objects.create(
             organisation=expense.organisation,
             transaction_type='sortie_caisse',
@@ -652,7 +706,7 @@ class CashExpenseListCreateView(generics.ListCreateAPIView):
             author=self.request.user,
         )
 
-class CashExpenseDetailView(generics.RetrieveUpdateDestroyAPIView):
+class CashExpenseDetailView(IdempotencyMixin, generics.RetrieveUpdateDestroyAPIView):
     serializer_class = CashExpenseSerializer
     permission_classes = [permissions.IsAuthenticated, IsCaissier]
 
@@ -707,7 +761,7 @@ class TransactionListView(generics.ListAPIView):
             queryset = queryset.filter(created_at__date__lte=end_date)
         return queryset.distinct().order_by('-created_at')
 
-class ConsignmentCreateView(APIView):
+class ConsignmentCreateView(IdempotencyMixin, APIView):
     """Le caissier consigne une ou plusieurs bouteilles emportees par le client
     (Section 3.1 du manuel : 'Consignation a la caisse ... effectuee et
     enregistree par le Caissier')."""
@@ -782,7 +836,7 @@ class ConsignmentListView(generics.ListAPIView):
             queryset = queryset.filter(client_name__icontains=client)
         return queryset
 
-class ConsignmentReturnView(APIView):
+class ConsignmentReturnView(IdempotencyMixin, APIView):
     """Retour de la bouteille vide : la Serveuse (ou la Caisse, selon
     l'organisation interne, Section 3.1 du manuel) valide la deconsignation."""
     permission_classes = [permissions.IsAuthenticated]
@@ -793,7 +847,10 @@ class ConsignmentReturnView(APIView):
 
         consignment = get_object_or_404(Consignment, id=pk, organisation=request.user.organisation)
         if consignment.status == 'rendue':
-            return Response({'detail': 'Consignation deja rendue.'}, status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {'detail': 'Consignation deja rendue.', 'code': 'consignment_already_returned'},
+                status=status.HTTP_409_CONFLICT
+            )
 
         consignment.status = 'rendue'
         consignment.returned_at = timezone.now()
@@ -816,7 +873,7 @@ class ConsignmentReturnView(APIView):
         return Response(ConsignmentSerializer(consignment).data)
 
 
-class ClientTabCreateView(generics.CreateAPIView):
+class ClientTabCreateView(IdempotencyMixin, generics.CreateAPIView):
     """Ouvre un onglet client pour la serveuse (tablette mobile) : un client
     physique peut ensuite consommer des produits de plusieurs departements,
     chacun materialise par une Order distincte liee a cet onglet."""
@@ -843,7 +900,7 @@ class ClientTabListView(generics.ListAPIView):
         return queryset
 
 
-class ClientTabDetailView(generics.RetrieveDestroyAPIView):
+class ClientTabDetailView(IdempotencyMixin, generics.RetrieveDestroyAPIView):
     """Lecture d'un onglet unique, a jour (orders/items imbriques) - utilisee par
     la tablette pour rafraichir un onglet quand la serveuse bascule entre
     plusieurs clients ouverts en parallele.
@@ -873,7 +930,7 @@ class ClientTabDetailView(generics.RetrieveDestroyAPIView):
         instance.delete()
 
 
-class ClientTabAddItemsView(APIView):
+class ClientTabAddItemsView(IdempotencyMixin, APIView):
     """Ajoute un lot de produits d'un departement donne a un onglet client ouvert.
     Cree ou reutilise l'Order (onglet, departement), resout le prix depuis
     DepartmentStock.sale_price (jamais depuis le payload client). La reponse
@@ -936,14 +993,26 @@ class ClientTabAddItemsView(APIView):
         order.total_amount = sum(i.quantity * i.unit_price for i in order.items.filter(is_removed=False))
         order.save()
 
-        bon = Bon.objects.create(
-            organisation=request.user.organisation,
-            client_tab=tab,
-            order=order,
-            department=department,
-            created_by=request.user,
-            total_amount=sum(qty * price for _, qty, price in deltas),
-        )
+        # Le client peut imposer l'UUID du bon : hors-ligne, la serveuse doit pouvoir le
+        # referencer (impression, annulation) avant meme que le serveur en ait connaissance.
+        bon_fields = {
+            'organisation': request.user.organisation,
+            'client_tab': tab,
+            'order': order,
+            'department': department,
+            'created_by': request.user,
+            'total_amount': sum(qty * price for _, qty, price in deltas),
+            'client_created_at': client_created_at(request),
+        }
+        requested_bon_id = request.data.get('bon')
+        if requested_bon_id:
+            if Bon.objects.filter(id=requested_bon_id).exists():
+                return Response(
+                    {'detail': 'Un bon portant cet identifiant existe deja.'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            bon_fields['id'] = requested_bon_id
+        bon = Bon.objects.create(**bon_fields)
         bon_items = BonItem.objects.bulk_create([
             BonItem(bon=bon, product=product, quantity=qty, unit_price=price)
             for product, qty, price in deltas
@@ -959,7 +1028,7 @@ class ClientTabAddItemsView(APIView):
         }, status=status.HTTP_201_CREATED)
 
 
-class BonCancelView(APIView):
+class BonCancelView(IdempotencyMixin, APIView):
     """Le caissier annule un bon (un lot ajoute) avant l'encaissement final -
     reverse son effet sur l'Order/OrderItem qu'il avait alimente, sans toucher
     au stock (jamais decremente avant l'encaissement de toute facon)."""
@@ -976,7 +1045,10 @@ class BonCancelView(APIView):
             )
 
         if bon.status != 'actif':
-            return Response({'detail': 'Ce bon est deja annule.'}, status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {'detail': 'Ce bon est deja annule.', 'code': 'bon_already_handled'},
+                status=status.HTTP_409_CONFLICT
+            )
         if bon.client_tab.status not in ['ouvert', 'facture']:
             return Response(
                 {'detail': "Cet onglet est deja encaisse, le bon ne peut plus etre annule."},
@@ -1015,7 +1087,7 @@ class BonCancelView(APIView):
         return Response(ClientTabSerializer(tab).data)
 
 
-class BonValidateView(APIView):
+class BonValidateView(IdempotencyMixin, APIView):
     """Le caissier valide un bon (un lot ajoute) : simple confirmation qu'il a
     bien recu/verifie ce lot, sans effet sur l'Order/OrderItem/le stock -
     contrairement a l'annulation qui reverse le lot, la validation ne fait que
@@ -1034,7 +1106,10 @@ class BonValidateView(APIView):
             )
 
         if bon.status != 'actif':
-            return Response({'detail': 'Ce bon ne peut plus etre valide.'}, status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {'detail': 'Ce bon ne peut plus etre valide.', 'code': 'bon_already_handled'},
+                status=status.HTTP_409_CONFLICT
+            )
         if bon.client_tab.status not in ['ouvert', 'facture']:
             return Response(
                 {'detail': "Cet onglet est deja encaisse, le bon ne peut plus etre valide."},
@@ -1049,7 +1124,7 @@ class BonValidateView(APIView):
         return Response(ClientTabSerializer(bon.client_tab).data)
 
 
-class ClientTabInvoiceView(APIView):
+class ClientTabInvoiceView(IdempotencyMixin, APIView):
     """La serveuse facture l'onglet : consolide toutes les Order (une par
     departement touche) en une facture unique, imprimee cote mobile."""
     permission_classes = [permissions.IsAuthenticated, IsServeur]
@@ -1139,7 +1214,7 @@ class ClientTabInvoicePdfView(APIView):
         return response
 
 
-class ClientTabCloseView(APIView):
+class ClientTabCloseView(IdempotencyMixin, APIView):
     """Encaissement cote caissier : cloture atomiquement toutes les Order de
     l'onglet (une par departement). La vente n'est plus bloquee par une
     penurie de stock (voir _validate_stock_for_closure, desormais no-op) :
@@ -1164,7 +1239,7 @@ class ClientTabCloseView(APIView):
             )
 
         try:
-            _require_open_cashier_session(request.user)
+            _require_open_cashier_session(request.user, request)
         except ValidationError as exc:
             return Response(exc.detail, status=status.HTTP_400_BAD_REQUEST)
 
@@ -1183,8 +1258,12 @@ class ClientTabCloseView(APIView):
             order.closed_at = timezone.now()
             order.cashier = request.user
             order.payment_type = payment_type
+            _stamp_offline_context(order, request)
             order.save()
             _create_sortie_vente_transaction(order, request.user)
+
+        # Une seule fois pour tout l'onglet : toutes ses commandes vont a la meme caisse.
+        cash_sessions.attach_and_refresh(orders[0].cashier_session)
 
         tab.status = 'encaisse'
         tab.closed_at = timezone.now()

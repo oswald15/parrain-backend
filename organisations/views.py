@@ -1,6 +1,5 @@
 from django.utils import timezone
 from django.db import transaction
-from django.db.models import Sum
 from rest_framework import generics, permissions, status
 from rest_framework.views import APIView
 from rest_framework.response import Response
@@ -10,8 +9,10 @@ from .serializers import (
     OrganisationSerializer, OrganisationAdminUpdateSerializer,
     DepartmentSerializer, BusinessDaySerializer, CashierDayBalanceSerializer
 )
-from .permissions import IsSuperAdmin, IsAdminOrSuperAdmin
+from .permissions import IsSuperAdmin, IsAdminOrSuperAdmin, CanOpenBusinessDay
 from orders.permissions import IsCaissier
+from sync.mixins import IdempotencyMixin
+from orders import cash_sessions
 
 class OrganisationMineView(generics.ListAPIView):
     """Lecture seule de SA PROPRE organisation - jamais une liste d'organisations tierces (un
@@ -108,10 +109,13 @@ class BusinessDayCurrentView(APIView):
 
 
 class BusinessDayOpenView(APIView):
-    """L'admin ouvre la journee en precisant le fond de caisse de depart de CHAQUE caissier
-    (chacun a son propre tiroir-caisse physique, d'ou un montant par caissier plutot qu'un
-    montant global) - bloque si une journee est deja ouverte."""
-    permission_classes = [IsAdminOrSuperAdmin]
+    """Ouvre la journee en precisant le fond de caisse de depart de CHAQUE caissier (chacun a son
+    propre tiroir-caisse physique, d'ou un montant par caissier plutot qu'un montant global) -
+    bloque si une journee est deja ouverte.
+
+    Accessible au caissier sur une instance locale (voir CanOpenBusinessDay) : sans cela, une
+    coupure d'internet a l'heure d'ouverture paralyserait le bar toute la journee."""
+    permission_classes = [CanOpenBusinessDay]
 
     @transaction.atomic
     def post(self, request):
@@ -178,12 +182,15 @@ class BusinessDayCloseView(APIView):
     """L'admin ferme la journee en cours : calcule et fige le solde de fermeture de chaque
     caissier (fond de depart + ventes encaissees - sorties de caisse depuis l'ouverture de la
     session - voir CashierDayBalance), puis bloque toute nouvelle action des roles non-admin
-    jusqu'a la prochaine ouverture (voir BusinessDayGateMiddleware)."""
-    permission_classes = [IsAdminOrSuperAdmin]
+    jusqu'a la prochaine ouverture (voir BusinessDayGateMiddleware).
+
+    Accessible au caissier sur une instance locale, pour la meme raison que l'ouverture : la
+    journee doit pouvoir etre arretee le soir meme si internet est tombe entre-temps."""
+    permission_classes = [CanOpenBusinessDay]
 
     @transaction.atomic
     def post(self, request):
-        from orders.models import Order, CashExpense, Transaction
+        from orders.models import Transaction
 
         current = BusinessDay.objects.filter(
             organisation=request.user.organisation, is_open=True
@@ -197,13 +204,7 @@ class BusinessDayCloseView(APIView):
         # journee (relais entre caissiers, voir CashierSessionCloseView) garde le solde qu'elle
         # a fige a ce moment-la.
         for balance in current.cashier_balances.filter(closing_amount__isnull=True):
-            revenue = Order.objects.filter(
-                cashier=balance.cashier, status='fermee', closed_at__gte=balance.opened_at
-            ).aggregate(total=Sum('total_amount'))['total'] or 0
-            expenses = CashExpense.objects.filter(
-                cashier=balance.cashier, created_at__gte=balance.opened_at, is_deleted=False
-            ).aggregate(total=Sum('amount'))['total'] or 0
-            balance.closing_amount = balance.opening_amount + revenue - expenses
+            balance.closing_amount = cash_sessions.compute_closing_amount(balance)
             balance.closed_at = timezone.now()
             balance.save()
             Transaction.objects.create(
@@ -222,7 +223,7 @@ class BusinessDayCloseView(APIView):
         return Response(BusinessDaySerializer(current).data)
 
 
-class CashierSessionOpenView(APIView):
+class CashierSessionOpenView(IdempotencyMixin, APIView):
     """Le caissier ouvre lui-meme une NOUVELLE session sur la journee en cours (ex: prise de
     poste apres qu'un collegue a ferme la sienne sur le meme creneau) - reprend automatiquement
     le fond de caisse alloue par l'admin au debut de la journee (identique pour toutes les
@@ -243,7 +244,9 @@ class CashierSessionOpenView(APIView):
 
         if day.cashier_balances.filter(cashier=request.user, closing_amount__isnull=True).exists():
             return Response(
-                {'detail': 'Vous avez deja une session de caisse ouverte.'}, status=status.HTTP_400_BAD_REQUEST
+                {'detail': 'Vous avez deja une session de caisse ouverte.',
+                 'code': 'session_already_open'},
+                status=status.HTTP_409_CONFLICT
             )
 
         reference_balance = day.cashier_balances.filter(cashier=request.user).order_by('opened_at').first()
@@ -270,7 +273,7 @@ class CashierSessionOpenView(APIView):
         return Response(CashierDayBalanceSerializer(session).data, status=status.HTTP_201_CREATED)
 
 
-class CashierSessionCloseView(APIView):
+class CashierSessionCloseView(IdempotencyMixin, APIView):
     """Le caissier ferme lui-meme sa session en cours : fige son solde de fermeture (fond de
     depart + ventes encaissees - sorties de caisse depuis l'ouverture de CETTE session) et remet
     son compteur 'du jour' (CaissierDailySummaryView) a zero. Il pourra ensuite (ou un autre
@@ -279,7 +282,7 @@ class CashierSessionCloseView(APIView):
 
     @transaction.atomic
     def post(self, request):
-        from orders.models import Order, CashExpense, Transaction
+        from orders.models import Transaction
 
         day = BusinessDay.objects.filter(
             organisation=request.user.organisation, is_open=True
@@ -290,16 +293,12 @@ class CashierSessionCloseView(APIView):
         session = day.cashier_balances.filter(cashier=request.user, closing_amount__isnull=True).first()
         if not session:
             return Response(
-                {'detail': "Vous n'avez pas de session de caisse ouverte."}, status=status.HTTP_400_BAD_REQUEST
+                {'detail': "Vous n'avez pas de session de caisse ouverte.",
+                 'code': 'no_open_session'},
+                status=status.HTTP_409_CONFLICT
             )
 
-        revenue = Order.objects.filter(
-            cashier=request.user, status='fermee', closed_at__gte=session.opened_at
-        ).aggregate(total=Sum('total_amount'))['total'] or 0
-        expenses = CashExpense.objects.filter(
-            cashier=request.user, created_at__gte=session.opened_at, is_deleted=False
-        ).aggregate(total=Sum('amount'))['total'] or 0
-        session.closing_amount = session.opening_amount + revenue - expenses
+        session.closing_amount = cash_sessions.compute_closing_amount(session)
         session.closed_at = timezone.now()
         session.save()
         Transaction.objects.create(

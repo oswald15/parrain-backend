@@ -264,15 +264,24 @@ class InventoryLine(models.Model):
 
     @property
     def current_system_quantity(self):
-        """Stock systeme EN TEMPS REEL pour ce produit/departement, relu a chaque acces plutot
-        que fige sur la valeur enregistree a la creation de l'inventaire - sans ca, les ventes
-        survenues pendant qu'un inventaire est en attente de saisie/validation ne se
-        reperctutaient jamais sur l'ecart affiche (difference)."""
+        """Stock systeme EN TEMPS REEL pour ce produit/departement, relu au lieu d'etre fige sur
+        la valeur enregistree a la creation de l'inventaire - sans ca, les ventes survenues
+        pendant qu'un inventaire est en attente de saisie/validation ne se repercuteraient
+        jamais sur l'ecart affiche (difference).
+
+        La lecture passe par la collection `department_stocks` du produit plutot que par une
+        requete ciblee : `difference`, `valuation` et le champ `system_quantity` du serializer
+        lisent tous cette valeur, ce qui faisait quatre requetes PAR LIGNE d'inventaire. Quand
+        l'appelant precharge `product__department_stocks` (voir InventoryListCreateView), les
+        acces suivants tapent dans le cache de prefetch et ne coutent plus rien.
+
+        Volontairement pas de `cached_property` ici : la valeur doit rester vive au sein d'une
+        meme instance, c'est tout l'objet de la synchronisation temps reel."""
         if self.department_id:
-            stock = DepartmentStock.objects.filter(
-                department_id=self.department_id, product_id=self.product_id
-            ).first()
-            return stock.quantity if stock else 0
+            for stock in self.product.department_stocks.all():
+                if stock.department_id == self.department_id:
+                    return stock.quantity
+            return 0
         return self.product.stock_quantity
 
     @property

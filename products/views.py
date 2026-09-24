@@ -28,6 +28,7 @@ from .serializers import (
     InventorySerializer,
 )
 from .permissions import IsAdminOrApprovisionneur, IsAdminOnly, IsAdminOrSuperAdmin
+from sync.guards import describe_blocking_bars
 
 class ProductListCreateView(generics.ListCreateAPIView):
     serializer_class = ProductSerializer
@@ -538,7 +539,13 @@ class InventoryListCreateView(generics.ListCreateAPIView):
     def get_queryset(self):
         return Inventory.objects.filter(
             organisation=self.request.user.organisation
-        ).prefetch_related('lines__product__category', 'lines__department')
+        ).prefetch_related(
+            'lines__product__category', 'lines__department',
+            # Indispensable : chaque ligne lit le stock systeme en direct (voir
+            # InventoryLine.current_system_quantity). Sans ce prechargement, l'ecran
+            # declenche une requete par ligne d'inventaire.
+            'lines__product__department_stocks',
+        )
 
     @transaction.atomic
     def perform_create(self, serializer):
@@ -582,7 +589,13 @@ class InventoryDetailView(generics.RetrieveUpdateAPIView):
     def get_queryset(self):
         return Inventory.objects.filter(
             organisation=self.request.user.organisation
-        ).prefetch_related('lines__product__category', 'lines__department')
+        ).prefetch_related(
+            'lines__product__category', 'lines__department',
+            # Indispensable : chaque ligne lit le stock systeme en direct (voir
+            # InventoryLine.current_system_quantity). Sans ce prechargement, l'ecran
+            # declenche une requete par ligne d'inventaire.
+            'lines__product__department_stocks',
+        )
 
     @transaction.atomic
     def partial_update(self, request, *args, **kwargs):
@@ -625,6 +638,18 @@ class InventoryValidateView(APIView):
         )
         if inventory.status == 'valide':
             return Response({'detail': 'Cet inventaire est deja valide.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # La validation ecrase le stock par le compte physique, en valeur absolue. Si un bar a
+        # des ventes qui n'ont pas encore remonte, elles disparaitraient du stock sans trace :
+        # les quantites sembleraient justes, mais elles ignoreraient des consommations
+        # reellement servies (voir sync/guards.py).
+        blocking = describe_blocking_bars(request.user.organisation)
+        if blocking:
+            return Response(
+                {'detail': blocking, 'code': 'bar_not_synced'},
+                status=status.HTTP_409_CONFLICT,
+            )
+
         lines = list(inventory.lines.select_related('product'))
         if any(line.physical_quantity is None for line in lines):
             return Response({'detail': 'Toutes les quantites physiques doivent etre saisies.'}, status=status.HTTP_400_BAD_REQUEST)

@@ -118,6 +118,11 @@ class CashierDayBalance(models.Model):
     closing_amount = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
     opened_at = models.DateTimeField(default=timezone.now)
     closed_at = models.DateTimeField(null=True, blank=True)
+    # Horodatage du dernier recalcul du solde APRES la fermeture de la session. Cas type : une
+    # vente encaissee hors-ligne arrive une fois la session fermee ; l'argent etait bien dans le
+    # tiroir au comptage, donc le solde est recalcule pour coller au reel - mais l'admin doit
+    # pouvoir voir qu'un montant deja arrete a bouge (voir orders/cash_sessions.py).
+    adjusted_after_close_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
         ordering = ['opened_at']

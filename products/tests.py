@@ -1,5 +1,7 @@
 from rest_framework.test import APITestCase
 from rest_framework import status
+from django.db import connection
+from django.test.utils import CaptureQueriesContext
 from django.urls import reverse
 from users.models import User
 from organisations.models import Organisation, Department
@@ -119,7 +121,12 @@ class StockTestCase(APITestCase):
 
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
 
-    def test_inventory_difference_is_physical_stock_minus_system_stock(self):
+    def test_inventory_difference_uses_live_stock_while_not_validated(self):
+        """Tant que l'inventaire n'est pas valide, l'ecart se calcule sur le stock systeme REEL
+        et non sur la photo prise a la creation : sinon les ventes survenues pendant la saisie
+        seraient comptees comme un ecart d'inventaire."""
+        self.product.stock_quantity = 50
+        self.product.save()
         inventory = Inventory.objects.create(
             organisation=self.org,
             created_by=self.approvisionneur,
@@ -146,3 +153,76 @@ class StockTestCase(APITestCase):
         self.assertEqual(loss_line.difference, -10)
         self.assertEqual(gain_line.valuation, Decimal('1000'))
         self.assertEqual(loss_line.valuation, Decimal('-1000'))
+
+        # Une vente de 10 unites pendant la saisie doit se repercuter immediatement sur l'ecart.
+        self.product.stock_quantity = 40
+        self.product.save()
+
+        self.assertEqual(gain_line.difference, 20)
+
+    def test_inventory_serialization_does_not_scale_queries_with_line_count(self):
+        """Garde-fou anti N+1 : l'ecran Inventaire lit le stock systeme en direct pour CHAQUE
+        ligne. Sans mise en cache, un inventaire de 200 produits declencherait des centaines de
+        requetes. Le nombre de requetes doit rester constant quel que soit le nombre de lignes."""
+        self.client.force_authenticate(user=self.approvisionneur)
+        dept = Department.objects.create(organisation=self.org, name='Salle')
+        inventory = Inventory.objects.create(
+            organisation=self.org, created_by=self.approvisionneur, valuation_mode='achat',
+        )
+
+        def build_lines(count):
+            for index in range(count):
+                product = Product.objects.create(
+                    name=f'Produit {uuid.uuid4()}', organisation=self.org, category=self.category,
+                    stock_quantity=10, min_threshold=5, price=1000, unit='bouteille',
+                )
+                DepartmentStock.objects.create(
+                    organisation=self.org, department=dept, product=product,
+                    quantity=10, weighted_average_cost=100, sale_price=150,
+                )
+                InventoryLine.objects.create(
+                    inventory=inventory, product=product, department=dept,
+                    system_quantity=10, physical_quantity=9, purchase_price=100, sale_price=150,
+                )
+
+        url = reverse('inventory-list-create')
+
+        build_lines(2)
+        with CaptureQueriesContext(connection) as small:
+            self.assertEqual(self.client.get(url).status_code, status.HTTP_200_OK)
+
+        build_lines(8)
+        with CaptureQueriesContext(connection) as large:
+            self.assertEqual(self.client.get(url).status_code, status.HTTP_200_OK)
+
+        self.assertEqual(
+            len(large.captured_queries), len(small.captured_queries),
+            f'Le nombre de requetes croit avec les lignes : {len(small.captured_queries)} pour '
+            f'2 lignes contre {len(large.captured_queries)} pour 10.'
+        )
+
+    def test_inventory_difference_is_frozen_once_validated(self):
+        """Une fois valide, l'ecart se fige sur system_quantity : l'historique (gain/perte
+        constate ce jour-la) ne doit plus bouger au gre des mouvements de stock ulterieurs."""
+        self.product.stock_quantity = 50
+        self.product.save()
+        inventory = Inventory.objects.create(
+            organisation=self.org,
+            created_by=self.approvisionneur,
+            valuation_mode='achat',
+            status='valide',
+        )
+        line = InventoryLine.objects.create(
+            inventory=inventory,
+            product=self.product,
+            system_quantity=50,
+            physical_quantity=60,
+            purchase_price=100,
+            sale_price=150,
+        )
+
+        self.product.stock_quantity = 5
+        self.product.save()
+
+        self.assertEqual(line.difference, 10)
+        self.assertEqual(line.valuation, Decimal('1000'))

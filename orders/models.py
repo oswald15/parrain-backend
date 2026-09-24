@@ -21,6 +21,9 @@ class ClientTab(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     invoiced_at = models.DateTimeField(blank=True, null=True)
     closed_at = models.DateTimeField(blank=True, null=True)
+    # Horodatage reel de l'action sur l'appareil quand elle a ete faite hors-ligne
+    # (audit et tracabilite ; voir sync/context.py).
+    client_created_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
         ordering = ['-created_at']
@@ -61,6 +64,14 @@ class Order(models.Model):
         User, on_delete=models.SET_NULL, blank=True, null=True, related_name='cancelled_orders'
     )
     cancel_reason = models.CharField(max_length=255, blank=True, null=True)
+    # Contexte d'une vente faite hors-ligne (voir sync/context.py). `closed_at` est horodate par
+    # le serveur au moment du rejeu, donc plusieurs heures apres l'encaissement reel : c'est
+    # `cashier_session` qui dit a QUELLE caisse rattacher la recette, pas la fenetre temporelle.
+    client_created_at = models.DateTimeField(null=True, blank=True)
+    cashier_session = models.ForeignKey(
+        'organisations.CashierDayBalance', on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='orders'
+    )
 
     class Meta:
         permissions = [
@@ -93,6 +104,11 @@ class CashExpense(models.Model):
     deleted_at = models.DateTimeField(blank=True, null=True)
     deleted_by = models.ForeignKey(
         User, on_delete=models.SET_NULL, blank=True, null=True, related_name='deleted_cash_expenses'
+    )
+    client_created_at = models.DateTimeField(null=True, blank=True)
+    cashier_session = models.ForeignKey(
+        'organisations.CashierDayBalance', on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='cash_expenses'
     )
 
     class Meta:
@@ -164,6 +180,9 @@ class Consignment(models.Model):
     returned_by = models.ForeignKey(
         User, on_delete=models.SET_NULL, null=True, blank=True, related_name='consignments_returned'
     )
+    # Horodatage reel de l'action sur l'appareil quand elle a ete faite hors-ligne
+    # (audit et tracabilite ; voir sync/context.py).
+    client_created_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
         ordering = ['-created_at']
@@ -192,6 +211,9 @@ class Bon(models.Model):
     cancelled_by = models.ForeignKey(
         User, on_delete=models.SET_NULL, null=True, blank=True, related_name='bons_cancelled'
     )
+    # Horodatage reel de l'action sur l'appareil quand elle a ete faite hors-ligne
+    # (audit et tracabilite ; voir sync/context.py).
+    client_created_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
         ordering = ['-created_at']

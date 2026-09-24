@@ -30,8 +30,17 @@ class LoginView(APIView):
     permission_classes = [AllowAny]
 
     def post(self, request):
+        from django.conf import settings
         from django.utils import timezone
         from console.services.licence import ServiceLicence
+
+        # Sur une instance installee dans un bar, les identifiants sont verifies par le serveur
+        # central : le bar ne detient aucune empreinte de mot de passe. Une coupure d'internet
+        # empeche donc de se connecter - mais une equipe deja connectee continue de travailler
+        # (voir sync/login_proxy.py).
+        if settings.IS_LOCAL_INSTANCE:
+            from sync.login_proxy import login_through_cloud
+            return login_through_cloud(request)
 
         serializer = LoginSerializer(data=request.data)
         if serializer.is_valid():

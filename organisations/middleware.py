@@ -1,4 +1,5 @@
 from django.http import JsonResponse
+from sync.context import is_replay
 from .auth_utils import resolve_user_from_token
 from .models import BusinessDay
 
@@ -11,6 +12,11 @@ EXEMPT_PREFIXES = (
     '/api/auth/login',
     '/api/auth/register',
     '/api/auth/logout',
+    # Signalement de consommations servies que rien n'a pu enregistrer (poste du caissier
+    # perdu). Ce n'est pas une vente de plus mais la declaration d'une vente qui a deja eu lieu,
+    # et elle se fait justement quand le bar ne tourne pas : journee fermee, materiel en panne.
+    # La soumettre au garde de journee reviendrait a ne jamais pouvoir la remonter.
+    '/api/sync/operations-abandonnees',
 )
 
 
@@ -55,6 +61,14 @@ class BusinessDayGateMiddleware:
             organisation_id=user.organisation_id, is_open=True
         ).exists()
         if is_open:
+            return None
+
+        # Rejeu d'une action faite hors-ligne : elle s'est produite alors que la journee etait
+        # bien ouverte, la refuser maintenant ferait perdre une vente reellement encaissee.
+        # C'est l'app qui verifie cette regle au moment de l'action, sur l'etat de journee
+        # qu'elle a en cache (decision de cadrage) ; ce gate ne protege que contre le travail
+        # en direct hors journee ouverte, pas contre la synchronisation d'un travail passe.
+        if is_replay(request):
             return None
 
         return JsonResponse(
