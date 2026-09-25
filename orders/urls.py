@@ -1,7 +1,8 @@
 from django.urls import path
 from .views import (
     OrderCreateView, OrderListView, AdminOrderListView, OrderStatusUpdateView,
-    OrderItemDeleteView, OrderCancelView, OrderValidateView, OrdersOpenedTodayView, OrdersClosedTodayView,
+    OrderItemDeleteView, OrderCancelView,
+    OrderCancelByKeyView, OrderItemRemoveByKeyView, OrderValidateView, OrdersOpenedTodayView, OrdersClosedTodayView,
     DailyRevenueView, GlobalDailyRevenueView, ServeurPerformanceView,
     CaissierDailySummaryView, DepartmentProfitabilityReportView, GlobalCashPositionView,
     CashExpenseListCreateView, CashExpenseDetailView, TransactionListView,
@@ -17,6 +18,11 @@ urlpatterns = [
     path('<uuid:pk>/update/', OrderStatusUpdateView.as_view(), name='order-update'),
     path('<uuid:order_id>/items/<int:item_id>/', OrderItemDeleteView.as_view(), name='order-item-delete'),
     path('<uuid:order_id>/cancel/', OrderCancelView.as_view(), name='order-cancel'),
+    # Reservee a la synchronisation : elle designe la commande par (onglet, departement), les
+    # seuls identifiants que le bar et le serveur central partagent (voir OrderCancelByKeyView).
+    path('corrections/annuler/', OrderCancelByKeyView.as_view(), name='order-cancel-by-key'),
+    path('corrections/retirer-ligne/', OrderItemRemoveByKeyView.as_view(),
+         name='order-item-remove-by-key'),
     path('<uuid:pk>/validate/', OrderValidateView.as_view(), name='order-validate'),
     path('opened/', OrdersOpenedTodayView.as_view(), name='orders-opened'),
     path('closed/', OrdersClosedTodayView.as_view(), name='orders-closed'),

@@ -16,7 +16,13 @@ class CanOpenBusinessDay(permissions.BasePermission):
             return False
         if request.user.role in ['admin', 'superadmin']:
             return True
-        return settings.IS_LOCAL_INSTANCE and request.user.role == 'caissier'
+        if settings.IS_LOCAL_INSTANCE and request.user.role == 'caissier':
+            return True
+        # Remontee d'une ouverture faite au bar. Elle a deja eu lieu : le refuser ici ne
+        # l'annule pas, cela bloque seulement la file du bar - et avec elle toutes les ventes
+        # de la journee, qui attendent derriere (voir push_upstream, l'ordre est strict).
+        from sync.models import SyncInstance
+        return isinstance(request.auth, SyncInstance) and request.user.role == 'caissier'
 
 
 class IsSuperAdmin(permissions.BasePermission):

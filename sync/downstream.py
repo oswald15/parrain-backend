@@ -13,6 +13,7 @@ import json
 from django.conf import settings
 
 from organisations.auth_utils import resolve_user_from_token
+from .corrections import rewrite
 from .models import PendingDownstreamRequest, SyncInstance
 
 SAFE_METHODS = ('GET', 'HEAD', 'OPTIONS')
@@ -100,11 +101,15 @@ class DownstreamCaptureMiddleware:
         ).exists():
             return
 
+        # Meme reecriture qu'a la remontee : l'identifiant technique de la commande est propre
+        # au cloud, le bar ne le connait pas (voir sync/corrections.py).
+        method, path, body = rewrite(request.method, request.path, body)
+
         PendingDownstreamRequest.objects.create(
             organisation_id=user.organisation_id,
             user=user,
-            method=request.method,
-            path=request.path,
+            method=method,
+            path=path,
             query_string=request.META.get('QUERY_STRING', '')[:500],
             body=body,
         )

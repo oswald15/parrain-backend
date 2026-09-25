@@ -17,6 +17,15 @@ EXEMPT_PREFIXES = (
     # et elle se fait justement quand le bar ne tourne pas : journee fermee, materiel en panne.
     # La soumettre au garde de journee reviendrait a ne jamais pouvoir la remonter.
     '/api/sync/operations-abandonnees',
+    # Ouverture et fermeture de la journee, et des sessions de caisse.
+    #
+    # Ce ne sont pas des ecritures metier mais les commandes qui pilotent le garde-fou lui-meme :
+    # les y soumettre rend l'ouverture impossible, puisqu'aucune journee n'est ouverte a ce
+    # moment-la. Sur une instance locale, le caissier est autorise a ouvrir la journee
+    # (CanOpenBusinessDay) precisement pour qu'une coupure d'internet le matin ne paralyse pas le
+    # bar - mais ce gate s'executant AVANT les permissions, il le bloquait avant meme que cette
+    # autorisation soit consultee. Qui a le droit d'ouvrir reste decide par les vues.
+    '/api/organisations/business-day/',
 )
 
 

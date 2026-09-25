@@ -1,3 +1,17 @@
+# Dependances du backend. `pip install -r requirements.txt` suffit : tout est la.
+#
+# Six bibliotheques sont utilisees DIRECTEMENT par le code :
+#   Django, djangorestframework, django-cors-headers  -> le socle web et l'API
+#   psycopg2-binary                                    -> acces a PostgreSQL
+#   python-decouple                                    -> lecture du fichier .env
+#   requests                                           -> appels de l'instance vers le serveur
+#   cryptography                                       -> signature des cles de licence
+#   xhtml2pdf (+ reportlab, pillow, svglib...)         -> factures et bons en PDF
+#   gunicorn                                           -> serveur de production sous Linux
+#
+# Tout le reste est entraine par celles-ci. Les versions sont figees pour qu'une installation
+# faite dans six mois donne exactement le meme resultat qu'aujourd'hui.
+
 arabic-reshaper==3.0.1
 asgiref==3.12.1
 certifi==2026.7.22

@@ -1,7 +1,7 @@
 import uuid
 from datetime import timedelta
 
-from django.test import TestCase
+from django.test import TestCase, override_settings
 from django.urls import reverse
 from django.utils import timezone
 from rest_framework.authtoken.models import Token
@@ -304,3 +304,53 @@ class InstanceStatusViewTests(TestCase):
         response = client.get(reverse('sync-etat'))
 
         self.assertEqual(response.status_code, 403)
+
+
+@override_settings(INSTANCE_ROLE='local', IS_LOCAL_INSTANCE=True)
+class GardeFouSurLePosteDuBarTests(TestCase):
+    """Le garde-fou anti-corrections ne doit PAS s'appliquer sur le poste du bar.
+
+    Il protege le serveur central contre des corrections portant sur des donnees qu'un bar est
+    peut-etre en train de modifier hors-ligne. Sur le poste, le bar EST cette autorite. Applique
+    la aussi, il empechait l'admin present sur place d'annuler quoi que ce soit - la ligne
+    d'instance locale n'ayant jamais de contact recent avec elle-meme."""
+
+    def setUp(self):
+        self.organisation = Organisation.objects.create(name=f'Org {uuid.uuid4()}')
+        self.admin = User.objects.create(
+            organisation=self.organisation, role='admin', name='Admin sur place',
+            phone=f'{uuid.uuid4().int % 10**9:09d}',
+        )
+        self.department = Department.objects.create(organisation=self.organisation, name='Bar')
+        self.product = Product.objects.create(
+            organisation=self.organisation, name='Castel', price=1000,
+            purchase_price=600, stock_quantity=50,
+        )
+        DepartmentStock.objects.create(
+            organisation=self.organisation, department=self.department, product=self.product,
+            quantity=50, weighted_average_cost=600, sale_price=1000,
+        )
+        self.order = Order.objects.create(
+            organisation=self.organisation, department=self.department,
+            status='fermee', number_of_customers=1, total_amount=2000,
+        )
+        OrderItem.objects.create(
+            order=self.order, product=self.product, quantity=2, unit_price=1000,
+        )
+        # Le poste se reconnait lui-meme, sans contact recent : c'est l'etat normal d'une
+        # instance locale, et c'est precisement ce qui declenchait le refus.
+        SyncInstance.objects.create(
+            organisation=self.organisation, name='Instance locale',
+            pending_operations=0, last_seen_at=None,
+        )
+        self.client = APIClient()
+        self.client.credentials(
+            HTTP_AUTHORIZATION=f'Token {Token.objects.create(user=self.admin).key}'
+        )
+
+    def test_l_admin_peut_annuler_une_vente_depuis_le_poste(self):
+        response = self.client.post(reverse('order-cancel', args=[self.order.id]))
+
+        self.assertEqual(response.status_code, 200, getattr(response, 'data', response.content))
+        self.order.refresh_from_db()
+        self.assertEqual(self.order.status, 'annulee')

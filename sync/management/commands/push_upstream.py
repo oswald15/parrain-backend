@@ -103,7 +103,13 @@ class Command(BaseCommand):
 
         # Jeton d'instance invalide ou revoque : toutes les operations suivantes echoueraient
         # de la meme facon. On s'arrete sans rien consommer, en attendant une intervention.
-        if response.status_code in (401, 403):
+        #
+        # 401 seulement, et c'est une distinction qui compte : l'authentification d'instance
+        # renvoie 401 (voir SyncInstanceAuthentication.authenticate_header), tandis qu'un 403
+        # vient d'une permission metier et ne concerne QUE cette operation. Les confondre gelait
+        # la file entiere derriere une seule action refusee - et avec elle toutes les ventes du
+        # bar, indefiniment.
+        if response.status_code == 401:
             self._record_attempt(entry, detail)
             return 'stop'
 

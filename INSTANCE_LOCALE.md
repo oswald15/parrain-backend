@@ -2,8 +2,8 @@
 
 Configuration de l'instance sur le poste du caissier, et ce qu'elle implique.
 
-**Machine neuve, sans Python ni PostgreSQL ?** Commencer par
-[INSTALLATION_POSTE.md](INSTALLATION_POSTE.md), qui part de zero et renvoie ici pour le detail.
+**Pour installer**, suivre [GUIDE_INSTALLATION.md](GUIDE_INSTALLATION.md), qui part d'un PC
+vierge. Ce document-ci explique le pourquoi et les limites connues.
 
 ## A quoi ca sert
 
@@ -196,9 +196,11 @@ La base du poste contient les ventes tant qu'elles ne sont pas remontees. Le scr
 
 ## Limites connues
 
-- **Les corrections qui descendent se limitent aux ventes** (`/api/orders/`). Une annulation faite
-  par l'admin atteint bien le bar ; d'autres actions a distance, comme la fermeture de la journee,
-  ne descendent pas encore.
+- **Les corrections circulent dans les deux sens** - annulation d'une vente et retrait d'une
+  ligne - depuis qu'elles sont adressees par identite naturelle : (onglet, departement) et
+  (onglet, departement, produit). Les identifiants techniques, eux, different de chaque cote
+  (voir sync/corrections.py). Toute correction ajoutee plus tard devra suivre la meme regle :
+  ne jamais designer une commande ou une ligne par son identifiant.
 - **Une correction que le bar refuse n'est pas rejouee.** Typiquement une vente deja annulee sur
   place. Le refus est ecrit dans le journal du service (`Correction refusee par le bar : ...`) et
   la descente continue, mais personne n'en est averti dans l'interface.

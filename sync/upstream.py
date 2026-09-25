@@ -13,6 +13,7 @@ import json
 from django.conf import settings
 
 from organisations.auth_utils import resolve_user_from_token
+from .corrections import rewrite
 from .models import PendingUpstreamRequest
 
 SAFE_METHODS = ('GET', 'HEAD', 'OPTIONS')
@@ -98,11 +99,15 @@ class UpstreamCaptureMiddleware:
         if not user or not getattr(user, 'organisation_id', None):
             return
 
+        # Adresse par identite naturelle quand c'est une correction : l'identifiant technique
+        # de la commande n'existe pas dans le cloud (voir sync/corrections.py).
+        method, path, body = rewrite(request.method, request.path, body)
+
         PendingUpstreamRequest.objects.create(
             organisation_id=user.organisation_id,
             user=user,
-            method=request.method,
-            path=request.path,
+            method=method,
+            path=path,
             query_string=request.META.get('QUERY_STRING', '')[:500],
             body=body,
             idempotency_key=request.META.get('HTTP_IDEMPOTENCY_KEY', '')[:255],

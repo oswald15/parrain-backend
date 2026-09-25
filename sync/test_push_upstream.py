@@ -1,4 +1,5 @@
 import uuid
+from io import StringIO
 from unittest.mock import patch
 
 import requests
@@ -150,3 +151,54 @@ class PushUpstreamTests(TestCase):
             call_command('push_upstream')
 
         sent.assert_not_called()
+
+
+@override_settings(INSTANCE_ROLE='local', IS_LOCAL_INSTANCE=True,
+                   CLOUD_API_URL=CLOUD, INSTANCE_TOKEN='jeton-instance')
+class RefusDePermissionTests(TestCase):
+    """Un refus portant sur UNE operation ne doit pas bloquer les suivantes.
+
+    Le cas reel : le caissier ouvre la journee au bar - il en a le droit la-bas - et cette
+    ouverture remonte vers un serveur central qui, lui, la reserve a l'admin. Confondre ce refus
+    avec un jeton revoque gelait la file entiere, et toutes les ventes de la journee restaient
+    bloquees derriere, indefiniment."""
+
+    def setUp(self):
+        self.organisation = Organisation.objects.create(name=f'Org {uuid.uuid4()}')
+        self.user = User.objects.create(
+            organisation=self.organisation, role='caissier', name='Caissier',
+            phone=f'{uuid.uuid4().int % 10**9:09d}',
+        )
+
+    def _queue(self, path):
+        return PendingUpstreamRequest.objects.create(
+            organisation=self.organisation, user=self.user, method='POST', path=path, body={},
+        )
+
+    def test_un_refus_de_permission_est_ecarte_et_la_file_continue(self):
+        refusee = self._queue('/api/organisations/business-day/open/')
+        suivante = self._queue('/api/orders/client-tabs/create/')
+
+        reponses = [FakeResponse(403, {'detail': 'You do not have permission.'}),
+                    FakeResponse(201, {})]
+        with patch('requests.request', side_effect=reponses):
+            call_command('push_upstream', stdout=StringIO())
+
+        refusee.refresh_from_db()
+        self.assertEqual(refusee.status, PendingUpstreamRequest.STATUS_QUARANTINED)
+        # La vente qui suivait est bien partie : c'est tout l'enjeu.
+        self.assertFalse(PendingUpstreamRequest.objects.filter(pk=suivante.pk).exists())
+
+    def test_un_jeton_revoque_arrete_tout_sans_rien_consommer(self):
+        """Distinction inverse : la, toutes les operations echoueraient pareil. Les mettre en
+        quarantaine les perdrait toutes pour une panne d'authentification reparable."""
+        premiere = self._queue('/api/orders/client-tabs/create/')
+        seconde = self._queue('/api/orders/client-tabs/create/')
+
+        with patch('requests.request', return_value=FakeResponse(401, {'detail': 'Instance inconnue.'})):
+            call_command('push_upstream', stdout=StringIO())
+
+        premiere.refresh_from_db()
+        seconde.refresh_from_db()
+        self.assertEqual(premiere.status, PendingUpstreamRequest.STATUS_PENDING)
+        self.assertEqual(seconde.status, PendingUpstreamRequest.STATUS_PENDING)

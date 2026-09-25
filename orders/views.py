@@ -1,4 +1,5 @@
 from rest_framework import generics, permissions, status
+from django.conf import settings
 from django.db import models, transaction
 from django.shortcuts import get_object_or_404
 from django.template.loader import render_to_string
@@ -134,6 +135,14 @@ def _refuse_if_bar_not_synced(request):
     # declencherait le garde-fou contre elle, enverrait la vente en quarantaine, et ferait
     # perdre exactement ce que ce mecanisme est cense proteger.
     if isinstance(request.auth, SyncInstance):
+        return None
+
+    # Sur le poste du bar, ce garde-fou n'a aucun sens : il protege le serveur central contre
+    # des corrections portant sur des donnees qu'un bar est peut-etre en train de modifier
+    # hors-ligne. Ici, le bar EST cette autorite. Applique quand meme, il empechait l'admin
+    # present sur place d'annuler quoi que ce soit - la ligne d'instance locale n'ayant jamais
+    # de "contact recent" avec elle-meme.
+    if settings.IS_LOCAL_INSTANCE:
         return None
 
     blocking = describe_blocking_bars(request.user.organisation)
@@ -326,6 +335,96 @@ class OrderStatusUpdateView(IdempotencyMixin, generics.UpdateAPIView):
             _create_sortie_vente_transaction(order, self.request.user)
             cash_sessions.attach_and_refresh(order.cashier_session)
 
+def _retirer_ligne(order, item, user):
+    """Retire une ligne d'une commande et en tire toutes les consequences.
+
+    Extrait en fonction parce que deux chemins y menent : l'ecran (adresse par l'identifiant de
+    la ligne) et la synchronisation (adressee par onglet + departement + produit, voir
+    OrderItemRemoveByKeyView). Les deux doivent produire exactement le meme effet.
+    """
+    removed_quantity = item.quantity
+    removed_amount = item.quantity * item.unit_price
+    removed_product = item.product
+
+    # Soft-delete : la ligne reste en base pour l'archivage, seule sa visibilite change.
+    item.is_removed = True
+    item.removed_at = timezone.now()
+    item.removed_by = user
+    item.save()
+
+    # Si le stock avait deja ete decompte (commande encaissee), on le recredite.
+    if order.status == 'fermee':
+        _apply_stock_delta(order.department, removed_product, removed_quantity)
+
+    order.total_amount = sum(i.quantity * i.unit_price for i in order.items.filter(is_removed=False))
+    order.save()
+
+    Transaction.objects.create(
+        organisation=order.organisation,
+        department=order.department,
+        product=removed_product,
+        transaction_type='avoir',
+        number=str(order.id),
+        quantity=removed_quantity,
+        amount=removed_amount,
+        waitress_code=order.serveur.phone if order.serveur else '',
+        serveur=order.serveur,
+        client=order.client_name,
+        order=order,
+        author=user,
+    )
+    return order
+
+
+class OrderItemRemoveByKeyView(APIView):
+    """Retire une ligne designee par (onglet, departement, produit).
+
+    Meme raison que OrderCancelByKeyView : la ligne porte un identifiant ENTIER auto-incremente,
+    donc necessairement different au bar et dans le cloud. Le produit, lui, vient du referentiel
+    et porte le meme identifiant des deux cotes - et une commande n'a qu'une ligne par produit
+    (voir ClientTabAddItemsView, qui cumule les quantites plutot que d'ajouter une ligne).
+
+    Idempotente : retirer une ligne deja retiree ne produit rien de plus. Sans cela, un second
+    passage recrediterait le stock une seconde fois et ecrirait un second avoir.
+    """
+
+    permission_classes = [permissions.IsAuthenticated, IsAdminOnly]
+
+    @transaction.atomic
+    def post(self, request):
+        client_tab = request.data.get('client_tab')
+        department = request.data.get('department')
+        product = request.data.get('product')
+        if not client_tab or not department or not product:
+            return Response(
+                {'detail': "client_tab, department et product sont requis."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        order = Order.objects.filter(
+            organisation=request.user.organisation,
+            client_tab_id=client_tab,
+            department_id=department,
+        ).first()
+        if order is None:
+            return Response(
+                {'detail': "Aucune commande pour cet onglet dans ce departement."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        item = OrderItem.objects.filter(order=order, product_id=product).first()
+        if item is None:
+            return Response(
+                {'detail': "Ce produit ne figure pas dans cette commande."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        if item.is_removed:
+            return Response(OrderSerializer(order).data)
+
+        _retirer_ligne(order, item, request.user)
+        return Response(OrderSerializer(order).data)
+
+
 class OrderItemDeleteView(APIView):
     permission_classes = [permissions.IsAuthenticated, IsAdminOnly]
 
@@ -338,39 +437,43 @@ class OrderItemDeleteView(APIView):
         order = get_object_or_404(Order, id=order_id, organisation=request.user.organisation)
         item = get_object_or_404(OrderItem, id=item_id, order=order, is_removed=False)
 
-        removed_quantity = item.quantity
-        removed_amount = item.quantity * item.unit_price
-        removed_product = item.product
-
-        # Soft-delete : la ligne reste en base pour l'archivage, seule sa visibilite change.
-        item.is_removed = True
-        item.removed_at = timezone.now()
-        item.removed_by = request.user
-        item.save()
-
-        # Si le stock avait deja ete decompte (commande encaissee), on le recredite.
-        if order.status == 'fermee':
-            _apply_stock_delta(order.department, removed_product, removed_quantity)
-
-        order.total_amount = sum(i.quantity * i.unit_price for i in order.items.filter(is_removed=False))
-        order.save()
-
-        Transaction.objects.create(
-            organisation=order.organisation,
-            department=order.department,
-            product=removed_product,
-            transaction_type='avoir',
-            number=str(order.id),
-            quantity=removed_quantity,
-            amount=removed_amount,
-            waitress_code=order.serveur.phone if order.serveur else '',
-            serveur=order.serveur,
-            client=order.client_name,
-            order=order,
-            author=request.user,
-        )
-
+        _retirer_ligne(order, item, request.user)
         return Response(OrderSerializer(order).data)
+
+
+def _annuler_commande(order, user, reason=''):
+    """Annule une commande et en tire toutes les consequences.
+
+    Extrait en fonction parce que deux chemins y menent : l'ecran (adresse par l'identifiant de
+    la commande) et la synchronisation (adressee par onglet + departement, voir
+    OrderCancelByKeyView). Les deux doivent produire exactement le meme effet.
+    """
+    # Si la commande etait deja encaissee, le stock decompte a la cloture est integralement recredite.
+    if order.status == 'fermee':
+        for item in order.items.filter(is_removed=False):
+            _apply_stock_delta(order.department, item.product, item.quantity)
+
+    order.status = 'annulee'
+    order.cancelled_at = timezone.now()
+    order.cancelled_by = user
+    order.cancel_reason = reason
+    order.save()
+
+    Transaction.objects.create(
+        organisation=order.organisation,
+        department=order.department,
+        transaction_type='annulation_facture',
+        number=str(order.id),
+        quantity=sum(i.quantity for i in order.items.filter(is_removed=False)),
+        amount=order.total_amount,
+        waitress_code=order.serveur.phone if order.serveur else '',
+        serveur=order.serveur,
+        client=order.client_name,
+        order=order,
+        author=user,
+    )
+    return order
+
 
 class OrderCancelView(APIView):
     permission_classes = [permissions.IsAuthenticated, IsAdminOrApprovisionneur]
@@ -385,31 +488,54 @@ class OrderCancelView(APIView):
         if order.status == 'annulee':
             return Response({'detail': 'Commande deja annulee.'}, status=status.HTTP_400_BAD_REQUEST)
 
-        # Si la commande etait deja encaissee, le stock decompte a la cloture est integralement recredite.
-        if order.status == 'fermee':
-            for item in order.items.filter(is_removed=False):
-                _apply_stock_delta(order.department, item.product, item.quantity)
+        _annuler_commande(order, request.user, request.data.get('reason', ''))
+        return Response(OrderSerializer(order).data)
 
-        order.status = 'annulee'
-        order.cancelled_at = timezone.now()
-        order.cancelled_by = request.user
-        order.cancel_reason = request.data.get('reason', '')
-        order.save()
 
-        Transaction.objects.create(
-            organisation=order.organisation,
-            department=order.department,
-            transaction_type='annulation_facture',
-            number=str(order.id),
-            quantity=sum(i.quantity for i in order.items.filter(is_removed=False)),
-            amount=order.total_amount,
-            waitress_code=order.serveur.phone if order.serveur else '',
-            serveur=order.serveur,
-            client=order.client_name,
-            order=order,
-            author=request.user,
-        )
+class OrderCancelByKeyView(APIView):
+    """Annule une commande designee par (onglet, departement) plutot que par son identifiant.
 
+    Reservee a la synchronisation. La raison tient en une phrase : une commande recoit un
+    identifiant DIFFERENT au bar et dans le cloud, parce que chaque base le fabrique de son cote.
+    Une annulation qui cite cet identifiant est donc incomprehensible pour l'autre - elle y
+    repond 404, et la correction se perd.
+
+    L'onglet et le departement, eux, portent les memes identifiants des deux cotes : le premier
+    est genere par le client, le second vient du referentiel. Et le couple designe une commande
+    unique (voir ClientTabAddItemsView, qui l'obtient par get_or_create).
+
+    Idempotente : annuler une commande deja annulee repond que c'est fait. Les deux cotes
+    reagissent souvent au meme probleme, et une erreur enverrait la correction en quarantaine
+    sans aucune raison.
+    """
+
+    permission_classes = [permissions.IsAuthenticated, IsAdminOrApprovisionneur]
+
+    @transaction.atomic
+    def post(self, request):
+        client_tab = request.data.get('client_tab')
+        department = request.data.get('department')
+        if not client_tab or not department:
+            return Response(
+                {'detail': "client_tab et department sont requis."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        order = Order.objects.filter(
+            organisation=request.user.organisation,
+            client_tab_id=client_tab,
+            department_id=department,
+        ).first()
+        if order is None:
+            return Response(
+                {'detail': "Aucune commande pour cet onglet dans ce departement."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        if order.status == 'annulee':
+            return Response(OrderSerializer(order).data)
+
+        _annuler_commande(order, request.user, request.data.get('reason', ''))
         return Response(OrderSerializer(order).data)
 
 class OrderValidateView(IdempotencyMixin, generics.UpdateAPIView):
