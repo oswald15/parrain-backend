@@ -18,6 +18,7 @@ from .views import (
     OrganisationSuspendreView,
     PaiementListCreateView,
     SuperadminCreateView,
+    InstanceLocaleListCreateView, InstanceLocaleRevoquerView,
     TableauDeBordView,
 )
 
@@ -30,6 +31,11 @@ urlpatterns = [
     path('organisations/<uuid:pk>/abonnements/', OrganisationAbonnementsHistoryView.as_view(), name='console-organisation-abonnements'),
     path('organisations/<uuid:pk>/codes/', OrganisationCodesHistoryView.as_view(), name='console-organisation-codes'),
     path('organisations/<uuid:pk>/creer-superadmin/', SuperadminCreateView.as_view(), name='console-organisation-creer-superadmin'),
+    # Postes installes dans les bars. Le jeton n'est renvoye qu'a la creation, jamais en liste.
+    path('organisations/<uuid:pk>/instances/', InstanceLocaleListCreateView.as_view(),
+         name='console-organisation-instances'),
+    path('organisations/<uuid:pk>/instances/<uuid:instance_id>/revoquer/',
+         InstanceLocaleRevoquerView.as_view(), name='console-organisation-instance-revoquer'),
     path('organisations/<uuid:pk>/suspendre/', OrganisationSuspendreView.as_view(), name='console-organisation-suspendre'),
     path('organisations/<uuid:pk>/reactiver/', OrganisationReactiverView.as_view(), name='console-organisation-reactiver'),
     path('organisations/<uuid:pk>/archiver/', OrganisationArchiverView.as_view(), name='console-organisation-archiver'),

@@ -312,3 +312,81 @@ class OperationAbandonneeTraiterView(APIView):
         operation.traitee_par = request.user
         operation.save(update_fields=['traitee_le', 'traitee_par'])
         return Response({'id': str(operation.pk), 'traitee_le': operation.traitee_le.isoformat()})
+
+
+class PostesView(APIView):
+    """Postes de l'etablissement, vus et geres par son admin.
+
+    La console de l'editeur les voit deja. Mais attendre l'editeur pour revoquer un poste vole,
+    un dimanche soir, n'est pas tenable : le patron doit pouvoir couper lui-meme. C'est cette
+    raison-la qui justifie cet ecran, plus que le confort de creer un poste sans appeler.
+
+    Aucun privilege nouveau : un admin a deja acces a toutes les donnees de son etablissement, et
+    un jeton ne donne acces qu'a celles-la.
+
+    **Le jeton n'est renvoye qu'a la creation**, comme dans la console - il permet d'agir au nom
+    de n'importe quel employe, et une page qui l'affiche en permanence l'expose aux captures
+    d'ecran.
+    """
+
+    permission_classes = [permissions.IsAuthenticated, IsAdminOrSuperAdmin]
+
+    def get(self, request):
+        organisation = request.user.organisation
+        behind = {
+            instance.pk: reason
+            for instance, reason in bars_not_up_to_date(organisation)
+        }
+        postes = SyncInstance.objects.filter(organisation=organisation)
+
+        return Response({'postes': [
+            {
+                'id': str(poste.id),
+                'nom': poste.name,
+                'actif': poste.is_active,
+                'cree_le': poste.created_at.isoformat(),
+                'dernier_contact': (
+                    poste.last_seen_at.isoformat() if poste.last_seen_at else None
+                ),
+                'operations_en_attente': poste.pending_operations,
+                'a_jour': poste.pk not in behind,
+                'retard': behind.get(poste.pk),
+            }
+            for poste in postes
+        ]})
+
+    def post(self, request):
+        nom = (request.data.get('nom') or 'Poste caisse').strip()[:150]
+        poste = SyncInstance.objects.create(
+            organisation=request.user.organisation, name=nom
+        )
+        return Response({
+            'id': str(poste.id),
+            'nom': poste.name,
+            'token': poste.token,
+            'avertissement': (
+                "Ce jeton ne sera plus affiche. Le recopier maintenant dans le fichier .env du "
+                "poste (INSTANCE_TOKEN)."
+            ),
+        }, status=201)
+
+
+class PosteRevoquerView(APIView):
+    """Coupe un poste immediatement - vol, perte, reinstallation.
+
+    Ne supprime pas la ligne : elle porte le dernier contact et ce qui restait a remonter, deux
+    informations qu'on veut encore pouvoir lire apres coup. Et les comptes du personnel ne sont
+    pas touches.
+    """
+
+    permission_classes = [permissions.IsAuthenticated, IsAdminOrSuperAdmin]
+
+    def post(self, request, pk):
+        poste = SyncInstance.objects.filter(
+            pk=pk, organisation=request.user.organisation
+        ).first()
+        if poste is None:
+            return Response({'detail': 'Poste introuvable.'}, status=404)
+
+        SyncInstance.objects.filter(pk=poste.pk).update(is_active=False)
+        return Response({'id': str(poste.id), 'actif': False})

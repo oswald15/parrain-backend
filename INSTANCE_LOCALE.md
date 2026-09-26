@@ -30,7 +30,10 @@ revient.
 
 ## 1. Creer l'instance dans la console
 
-Cote serveur central :
+Depuis la console, fiche de l'etablissement, onglet **Postes installes** : le jeton s'affiche a
+la creation, une seule fois. C'est aussi la qu'on revoque un poste vole.
+
+En ligne de commande, cote serveur central :
 
 ```bash
 docker compose exec backend python manage.py creer_instance --organisation "NOM DU BAR"
@@ -40,9 +43,14 @@ Sans `--organisation`, elle liste les etablissements. Elle affiche une ligne `IN
 a recopier a l'etape 2 - **la noter tout de suite**, elle ne sera pas reaffichee.
 
 Un second appel sur le meme etablissement refuse : il faut choisir explicitement
-`--supplementaire` (un deuxieme poste dans le meme bar) ou `--remplacer` (poste vole ou
-reinstalle, les anciens jetons cessent immediatement de marcher). Rien n'est jamais revoque sans
-qu'on le demande : un jeton coupe par megarde arrete un bar en plein service.
+`--supplementaire` ou `--remplacer` (poste vole ou reinstalle, les anciens jetons cessent
+immediatement de marcher). Rien n'est jamais revoque sans qu'on le demande : un jeton coupe par
+megarde arrete un bar en plein service.
+
+**`--supplementaire` ne sert qu'a preparer une machine de secours.** Un etablissement ne doit
+avoir qu'UN SEUL poste allume a la fois : chacun a sa propre base, et deux postes simultanes
+couperaient l'etablissement en deux - les serveuses branchees sur l'un deviendraient invisibles
+pour le caissier de l'autre.
 
 Ce jeton vaut pour toutes les operations de cet etablissement - et d'aucun autre. Le revoquer ne
 touche pas aux comptes du personnel.

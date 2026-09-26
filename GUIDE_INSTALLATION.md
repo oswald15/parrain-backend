@@ -89,7 +89,6 @@ chez vous avant de partir.** Sinon vous y passez la soiree.
 
 - [ ] L'installateur **Python 3.13** — https://python.org/downloads (Windows installer 64-bit)
 - [ ] L'installateur **PostgreSQL 17** — https://postgresql.org/download/windows
-- [ ] L'installateur **Node.js LTS** — https://nodejs.org
 - [ ] **Le dossier du projet** entier (`le_parrain-main` et `le_parrain_front-main`)
 - [ ] **L'APK** de l'application des serveuses
 - [ ] Les **paquets Python** deja telecharges (voir encadre ci-dessous)
@@ -108,14 +107,14 @@ chez vous avant de partir.** Sinon vous y passez la soiree.
 > ```
 > Copiez le dossier `paquets_python` sur la cle.
 >
-> Dans `le_parrain_front-main` :
+> **L'interface du caissier**, construite chez vous - elle n'a besoin de rien au bar :
 > ```
+> cd le_parrain_front-main
 > npm ci
 > npm run build -- --configuration instance
 > ```
-> Copiez les dossiers `node_modules` et `dist` sur la cle.
->
-> Au bar, plus rien a telecharger.
+> Copiez seulement le dossier `dist` sur la cle. **Node.js n'est pas a installer au bar** :
+> c'est le serveur local qui sert l'interface.
 
 ---
 
@@ -137,7 +136,8 @@ redeployez-le avec la derniere version du code. Sans cela, rien de la suite ne f
 ### Etape 2 — Verifier que l'etablissement existe
 
 Le bar doit deja exister sur le serveur, avec ses produits, ses departements et son personnel.
-Si ce n'est pas le cas :
+
+**Pour un vrai bar :**
 
 1. Dans la **console systeme**, creez l'organisation et son **superadmin**.
 2. Connectez-vous avec ce superadmin sur `https://parrain-seven.vercel.app`.
@@ -146,7 +146,34 @@ Si ce n'est pas le cas :
 
 Notez les identifiants du caissier et d'une serveuse : vous en aurez besoin pour le test.
 
+**Pour une repetition chez vous**, une commande monte tout d'un coup :
+
+```bash
+docker compose exec backend python manage.py creer_etablissement_test     --nom "ZZ Test Instance" --mot-de-passe "UnMotDePasseLong!2026"
+```
+
+Elle cree un departement, un produit avec du stock, et trois comptes (admin, caissier,
+serveuse), puis affiche leurs numeros.
+
+**Ne faites JAMAIS la repetition sur un vrai etablissement** : elle y cree de vraies ventes,
+qu'il faudrait ensuite demeler de sa comptabilite. La commande refuse d'ecrire dans un
+etablissement existant, c'est la seule chose qui vous separe de cette erreur.
+
+**Supprimez cet etablissement une fois la repetition terminee** : ses trois comptes partagent
+un mot de passe et n'ont aucune raison de survivre sur un serveur de production.
+
 ### Etape 3 — Creer le jeton du poste
+
+**Depuis la console**, le plus simple : ouvrez la fiche de l'etablissement, onglet
+**« Postes installes »**, bouton **Creer le poste**. Le jeton s'affiche, avec un bouton pour le
+copier.
+
+**Il n'est affiche qu'une fois.** Recopiez-le tout de suite. Perdu, il ne se retrouve pas : on
+en cree un autre et on revoque l'ancien - ce qui se fait depuis le meme ecran.
+
+Cet ecran montre aussi, pour chaque poste, son dernier contact et ce qu'il lui reste a remonter.
+
+**En ligne de commande**, si vous n'avez pas acces a la console :
 
 ```bash
 docker compose exec backend python manage.py creer_instance --organisation "NOM EXACT DU BAR"
@@ -211,23 +238,13 @@ psql --version
 **Si vous voyez « psql n'est pas reconnu » :** ajoutez `C:\Program Files\PostgreSQL\17\bin`
 au PATH de Windows, fermez PowerShell, rouvrez-le, reessayez.
 
-### Etape 7 — Installer Node.js
-
-Lancez l'installateur Node.js, cliquez « Next » partout.
-
-**Verifier :**
-
-```powershell
-node --version
-```
-
 ### Etape 8 — Copier le projet
 
 Copiez le projet depuis la cle vers **`C:\parrain`**. Vous devez avoir :
 
 ```
 C:\parrain\le_parrain-main
-C:\parrain\le_parrain_front-main
+C:\parrain\le_parrain_front-main\dist      (l'interface deja construite)
 C:\parrain\paquets_python
 ```
 
@@ -382,22 +399,27 @@ python manage.py run_sync
 
 **Laissez cette fenetre ouverte aussi.** C'est elle qui envoie les ventes au serveur.
 
-### Etape 16 — Preparer l'ecran du caissier
+### Etape 16 — L'ecran du caissier : rien a lancer
 
-Ouvrez **une CINQUIEME fenetre PowerShell** :
+**Le serveur local sert deja l'interface**, sur le meme port que le reste. Ni logiciel
+supplementaire, ni fenetre de plus a garder ouverte.
 
-```powershell
-cd C:\parrain\le_parrain_front-main
-npm install -g serve
-serve -s dist\esther-pay\browser -l 4200
+Verifiez simplement, dans le navigateur du poste :
+
+```
+http://localhost:8000
 ```
 
-> Si vous n'avez pas copie `dist` depuis chez vous, faites avant :
-> `npm ci` puis `npm run build -- --configuration instance`
+**Ce que vous devez voir :** l'ecran de connexion.
 
-**Ce que vous devez voir :** `Accepting connections at http://localhost:4200`
+**Si vous voyez une erreur Django**, le dossier `dist` n'est pas au bon endroit. Le fichier
+`index.html` doit se trouver en
+`C:\parrain\le_parrain_front-main\dist\esther-pay\browser\index.html`. Sinon, indiquez le chemin
+dans le `.env` :
 
-**Laissez cette fenetre ouverte.**
+```
+INSTANCE_SPA_DIR=C:\chemin\vers\dist\esther-pay\browser
+```
 
 ### Etape 17 — Faire tout redemarrer tout seul
 
@@ -405,20 +427,20 @@ serve -s dist\esther-pay\browser -l 4200
 coupures de courant et des extinctions le soir. Si elle est mal faite, un matin le systeme ne
 redemarre pas et personne ne comprend pourquoi.
 
-Quatre choses doivent revenir seules :
+Trois choses doivent revenir seules :
 
 | Quoi | Comment ca redemarre |
 |---|---|
 | PostgreSQL | Tout seul (service Windows installe en « Automatique ») |
-| Le backend | Tache planifiee (ci-dessous) |
+| Le backend (qui sert aussi l'interface) | Tache planifiee (ci-dessous) |
 | La synchronisation | Tache planifiee (ci-dessous) |
-| L'ecran du caissier | Tache planifiee + raccourci de demarrage (etape 17 bis) |
+| Le navigateur du caissier | Raccourci de demarrage (etape 17 bis) |
 
-#### Creer les trois taches
+#### Creer les deux taches
 
 Ouvrez le **Planificateur de taches** (menu Demarrer, tapez « planificateur »).
 
-Pour **chacune** des trois lignes du tableau : clic droit sur « Bibliotheque du Planificateur »
+Pour **chacune** des deux lignes du tableau : clic droit sur « Bibliotheque du Planificateur »
 > **Creer une tache** (surtout pas « Creer une tache de base », elle n'a pas les reglages qu'il
 faut).
 
@@ -453,7 +475,6 @@ faut).
 |---|---|---|---|
 | Parrain - Backend | `C:\parrain\le_parrain-main\.venv\Scripts\python.exe` | `manage.py runserver 0.0.0.0:8000 --noreload` | `C:\parrain\le_parrain-main` |
 | Parrain - Synchro | `C:\parrain\le_parrain-main\.venv\Scripts\python.exe` | `manage.py run_sync` | `C:\parrain\le_parrain-main` |
-| Parrain - Ecran caisse | `C:\Program Files\nodejs\npx.cmd` | `serve -s dist\esther-pay\browser -l 4200` | `C:\parrain\le_parrain_front-main` |
 
 Windows demandera le **mot de passe du compte Windows** a l'enregistrement de chaque tache.
 C'est normal : c'est ce qui lui permet de les lancer sans que personne soit connecte.
@@ -471,7 +492,7 @@ Le caissier arriverait devant un bureau vide.
 3. Clic droit dans ce dossier > **Nouveau > Raccourci**.
 4. Comme emplacement, saisissez (en adaptant a votre navigateur) :
    ```
-   "C:\Program Files\Google\Chrome\Application\chrome.exe" --start-fullscreen http://localhost:4200
+   "C:\Program Files\Google\Chrome\Application\chrome.exe" --start-fullscreen http://localhost:8000
    ```
 5. Nommez-le « Caisse » et validez.
 
@@ -512,15 +533,31 @@ Vous pouvez tester une tache sans redemarrer : clic droit dessus > **Executer**.
 
 ## PARTIE 3 — Les tablettes et le navigateur
 
-### Etape 18 — Le navigateur du caissier
+### Etape 18 — Les navigateurs des caissiers
 
-L'etape 17 bis l'ouvre deja automatiquement au demarrage. Il reste deux choses a faire.
+L'etape 17 bis ouvre deja celui du PC serveur au demarrage.
 
-**Verifiez l'adresse affichee** — elle doit etre exactement :
+**Sur le PC qui heberge le serveur local :**
 
 ```
-http://localhost:4200
+http://localhost:8000
 ```
+
+**Sur les AUTRES postes de caisse** (les autres caissiers, sur leurs propres PC) :
+
+```
+http://192.168.1.10:8000
+```
+
+en remplacant par l'adresse du poste serveur. Mettez-la en page de demarrage sur chacun.
+
+> **Un seul serveur local par batiment, plusieurs caisses dessus.** Tous les caissiers voient
+> ainsi les memes onglets - ce qui est indispensable, puisqu'un meme onglet peut concerner
+> plusieurs departements et donc plusieurs caissiers.
+>
+> Le caissier du PC serveur est le seul a beneficier du cache hors-ligne du navigateur
+> (`localhost` est la seule origine que le navigateur considere comme sure). Les autres n'en ont
+> pas besoin : le serveur local reste joignable tant que le Wi-Fi tient.
 
 **Dites au caissier de ne JAMAIS ouvrir `parrain-seven.vercel.app` sur ce PC.** Sans internet,
 cette page ne s'afficherait meme pas, et il croirait le systeme en panne. Retirez-la des
@@ -548,7 +585,7 @@ A faire **une seule fois par tablette**.
 
 ### Etape 20 — Preparer
 
-1. **Avec internet**, le caissier se connecte sur `http://localhost:4200`.
+1. **Avec internet**, le caissier se connecte sur `http://localhost:8000`.
 2. **Avec internet**, la serveuse se connecte sur sa tablette.
 3. L'admin ouvre la journee. (Sans internet, le caissier peut l'ouvrir lui-meme.)
 
@@ -681,7 +718,8 @@ apres le 22/09/2026.
 
 ### Le caissier a une page blanche
 
-Son navigateur est sur Vercel au lieu de `http://localhost:4200`.
+Son navigateur est sur Vercel au lieu de `http://localhost:8000` (ou de l'adresse du poste
+serveur, pour les autres caisses).
 
 ### Ce matin, rien ne s'est lance apres le redemarrage
 

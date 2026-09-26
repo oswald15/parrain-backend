@@ -8,6 +8,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from organisations.models import Organisation
+from sync.models import SyncInstance
 
 from .models import Abonnement, CodeActivation, Editeur, EditeurToken, Formule, Journal, Paiement
 from .serializers import (
@@ -286,3 +287,86 @@ class TableauDeBordView(EditeurAPIView):
             'paiements_du_mois_xaf': paiements_mois,
             'organisations_bloquees': Organisation.objects.filter(statut='bloquee').count(),
         })
+
+
+class InstanceLocaleListCreateView(EditeurAPIView):
+    """Postes installes dans un etablissement, et creation de leur jeton.
+
+    Le jeton n'etait obtenable qu'en ligne de commande, par SSH. Tant que c'est l'editeur qui
+    installe, cela passe ; des qu'un tiers equipe un bar, il est bloque.
+
+    **Le jeton n'est renvoye qu'a la creation.** La liste ne le contient jamais. Il permet d'agir
+    au nom de n'importe quel employe de l'etablissement : le laisser lisible en permanence dans
+    une page web l'exposerait aux captures d'ecran, aux partages d'ecran et aux comptes editeurs
+    d'anciens collaborateurs. Perdu, il se remplace - c'est moins couteux que de le laisser
+    trainer.
+
+    A savoir tout de meme : le jeton reste stocke en clair en base. N'etre affiche qu'une fois
+    limite l'exposition courante, ce n'est pas une garantie cryptographique.
+    """
+
+    def get(self, request, pk):
+        organisation = generics.get_object_or_404(Organisation, pk=pk)
+        instances = SyncInstance.objects.filter(organisation=organisation)
+        return Response({'instances': [
+            {
+                'id': str(instance.id),
+                'nom': instance.name,
+                'actif': instance.is_active,
+                'cree_le': instance.created_at.isoformat(),
+                'dernier_contact': (
+                    instance.last_seen_at.isoformat() if instance.last_seen_at else None
+                ),
+                'operations_en_attente': instance.pending_operations,
+                # Volontairement absent : voir la docstring.
+            }
+            for instance in instances
+        ]})
+
+    def post(self, request, pk):
+        organisation = generics.get_object_or_404(Organisation, pk=pk)
+        nom = (request.data.get('nom') or 'Poste caisse').strip()[:150]
+
+        instance = SyncInstance.objects.create(organisation=organisation, name=nom)
+
+        Journal.objects.create(
+            acteur=request.user, action='creation_instance_locale', organisation=organisation,
+            # Jamais le jeton dans le journal : il y resterait lisible indefiniment, ce que
+            # l'affichage unique cherche precisement a eviter.
+            details={'nom': instance.name, 'instance': str(instance.id)},
+        )
+
+        return Response({
+            'id': str(instance.id),
+            'nom': instance.name,
+            'token': instance.token,
+            'avertissement': (
+                "Ce jeton ne sera plus affiche. Le recopier maintenant dans le fichier .env du "
+                "poste du caissier (INSTANCE_TOKEN)."
+            ),
+        }, status=status.HTTP_201_CREATED)
+
+
+class InstanceLocaleRevoquerView(EditeurAPIView):
+    """Coupe un poste immediatement - vol, reinstallation, jeton egare.
+
+    Ne supprime pas la ligne : elle porte la date du dernier contact et ce qui restait a
+    remonter, deux informations qu'on veut encore pouvoir lire apres coup. Et les comptes du
+    personnel ne sont pas touches.
+    """
+
+    def post(self, request, pk, instance_id):
+        organisation = generics.get_object_or_404(Organisation, pk=pk)
+        instance = generics.get_object_or_404(
+            SyncInstance, pk=instance_id, organisation=organisation
+        )
+
+        if instance.is_active:
+            SyncInstance.objects.filter(pk=instance.pk).update(is_active=False)
+            Journal.objects.create(
+                acteur=request.user, action='revocation_instance_locale',
+                organisation=organisation,
+                details={'nom': instance.name, 'instance': str(instance.id)},
+            )
+
+        return Response({'id': str(instance.id), 'actif': False})

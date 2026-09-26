@@ -3,6 +3,8 @@ from django.urls import path, include
 from django.conf import settings
 from django.conf.urls.static import static
 
+from . import spa
+
 urlpatterns = [
     path('admin/', admin.site.urls),
     path('api/auth/', include('users.urls')),
@@ -12,3 +14,8 @@ urlpatterns = [
     path('api/console/', include('console.urls')),
     path('api/sync/', include('sync.urls')),
 ] + static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
+
+# EN DERNIER, et seulement sur l'instance d'un bar : ces routes capturent tout ce qui n'a pas
+# ete reconnu plus haut, pour que les adresses internes de l'interface fonctionnent au
+# rafraichissement. Placees avant /api/, elles l'avaleraient (voir le_parrain/spa.py).
+urlpatterns += spa.urlpatterns()

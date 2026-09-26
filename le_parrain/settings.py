@@ -201,6 +201,14 @@ INSTANCE_TOKEN = config('INSTANCE_TOKEN', default='')
 # rendu, ecritures au journal, session de caisse - que si le caissier l'avait faite sur place.
 LOCAL_API_URL = config('LOCAL_API_URL', default='http://127.0.0.1:8000')
 
+# Interface du caissier, servie par l'instance du bar elle-meme (voir le_parrain/spa.py).
+# Un bar a plusieurs caisses : toutes doivent joindre le meme serveur, donc la page ne peut pas
+# contenir une adresse figee sur localhost. Sans objet sur le serveur central.
+INSTANCE_SPA_DIR = config(
+    'INSTANCE_SPA_DIR',
+    default=str(BASE_DIR.parent / 'le_parrain_front-main' / 'dist' / 'esther-pay' / 'browser'),
+)
+
 # Signature des codes d'activation (console systeme) - voir console/management/commands/generer_cle_editeur.py.
 # Cle privee : secret, uniquement dans .env, lue par console/services/licence.py (emission).
 # Cle publique : pas un secret, lue par organisations/services/verification_licence.py (verification).
